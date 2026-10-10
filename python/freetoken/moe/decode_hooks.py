@@ -26,7 +26,9 @@ class DecodeHooks:
         """Allocate device memory before the cache is sized; the engine charges the bytes."""
 
     def bind(self, engine, cache: OffloadMoeCache) -> None:
-        """Called once after the offload cache exists and before CUDA graph capture."""
+        """Called after the offload cache exists and again after every cache rebuild, each time
+        before CUDA graph capture. Graph warmup and capture call ``observe`` and ``copy_missing``
+        without any request or step callback, so bind must leave all device state valid."""
 
     def begin_request(self, uid: int) -> None:
         """Called before every prefill forward (one per chunk) and when the decoding request changes."""
@@ -42,7 +44,11 @@ class DecodeHooks:
         """Called per decode MoE layer before ``topk_ids`` is rewritten into slot ids."""
 
     def copy_missing(self, cache: OffloadMoeCache, layer_id: int) -> bool:
-        """Return True after enqueueing this layer's demand copy; False runs the engine's copy."""
+        """Return True after enqueueing this layer's whole copy schedule; False runs the engine's copy.
+
+        Called on every decode MoE layer, also when nothing is missing. True means the hook
+        also made the current stream wait for its copy before the expert GEMM.
+        """
         return False
 
 

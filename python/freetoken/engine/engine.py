@@ -657,7 +657,7 @@ class Engine:
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         if self.decode_hooks is not None:
             charged = charge_reservation(self, self.decode_hooks)
-            logger.info_rank0(f"--expert-predictor: {charged / 2**20:.1f} MiB charged to the weights before cache sizing")
+            logger.info_rank0(f"decode hooks: {charged / 2**20:.1f} MiB charged to the weights before cache sizing")
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
@@ -788,14 +788,6 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
-        if self.decode_hooks is None and config.moe_demand_copy_stripes:
-            from freetoken.moe.striped_demand import StripedDemand, StripedDemandHooks
-
-            # without a predictor no stage exists; one slot keeps the kernel's stage lookup trivial
-            self.decode_hooks = StripedDemandHooks(StripedDemand(
-                num_layers=config.model_config.num_moe_layers, num_experts=cache.num_experts,
-                stripes=config.moe_demand_copy_stripes, stage_slots=1, device=self.device,
-            ))
         if self.decode_hooks is not None:
             cache.decode_hooks = self.decode_hooks
             self.decode_hooks.bind(self, cache)
@@ -1044,6 +1036,9 @@ class Engine:
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             self.moe_offload_cache.rebuild(moe_cache_size)
+            if self.decode_hooks is not None:
+                # the rebuild reallocated the copy descriptors and miss lists the hooks captured
+                self.decode_hooks.bind(self, self.moe_offload_cache)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
@@ -1385,9 +1380,18 @@ def _expert_parallel(config: EngineConfig) -> bool | None:
 
 
 def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
-    """Build the --expert-predictor hooks, or None; refuse settings the predictor does not serve."""
+    """Build the --expert-predictor or --moe-demand-copy-stripes hooks, or None.
+
+    Refuses settings the predictor does not serve. The hooks exist before the offload cache,
+    so the memory they reserve is charged before the cache is sized.
+    """
     if config.expert_predictor is None:
-        return None
+        if not config.moe_demand_copy_stripes:
+            return None
+        from freetoken.moe.striped_demand import StripedDemandHooks
+
+        model = config.model_config
+        return StripedDemandHooks(model.num_moe_layers, model.num_experts, config.moe_demand_copy_stripes)
     problems = []
     if config.moe_strategy != "offload":
         problems.append(f"--moe-strategy {config.moe_strategy} (needs offload)")
@@ -1395,6 +1399,9 @@ def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
         problems.append("--moe-cpu-layers (every layer must decode on the GPU)")
     if config.max_running_req != 1:
         problems.append(f"--max-running-requests {config.max_running_req} (needs 1)")
+    graph_sizes = [*(config.cuda_graph_bs or []), config.cuda_graph_max_bs or 1]
+    if max(graph_sizes) > 1:
+        problems.append(f"CUDA graph batch sizes up to {max(graph_sizes)} (needs 1)")
     if config.moe_demand_copy_stripes < 1:
         problems.append("--moe-demand-copy-stripes 0 (the predictor's stage is read by the striped copy; 16 was measured)")
     if problems:

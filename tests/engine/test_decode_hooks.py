@@ -18,13 +18,28 @@ from freetoken.moe.decode_hooks import DecodeHooks, charge_reservation
 
 def _cfg(**change):
     cfg = dict(expert_predictor="some/predictor", moe_strategy="offload", moe_cpu_layers=None, max_running_req=1,
-               moe_demand_copy_stripes=16)
+               moe_demand_copy_stripes=16, cuda_graph_bs=None, cuda_graph_max_bs=None,
+               model_config=SimpleNamespace(num_moe_layers=40, num_experts=256))
     cfg.update(change)
     return SimpleNamespace(**cfg)
 
 
 def test_no_flag_no_hooks():
-    assert _load_decode_hooks(_cfg(expert_predictor=None, moe_strategy="cpu", max_running_req=4)) is None
+    assert _load_decode_hooks(_cfg(expert_predictor=None, moe_strategy="cpu", max_running_req=4,
+                                   moe_demand_copy_stripes=0)) is None
+
+
+def test_stripes_without_predictor_build_striped_hooks():
+    from freetoken.moe.striped_demand import StripedDemandHooks
+
+    hooks = _load_decode_hooks(_cfg(expert_predictor=None, max_running_req=4))
+    assert isinstance(hooks, StripedDemandHooks) and hooks.shape == (40, 256, 16)
+
+
+@pytest.mark.parametrize("graphs", [dict(cuda_graph_bs=[1, 2]), dict(cuda_graph_max_bs=4)])
+def test_predictor_refuses_graph_batches_above_one(graphs):
+    with pytest.raises(ValueError, match="CUDA graph batch sizes up to"):
+        _load_decode_hooks(_cfg(**graphs))
 
 
 def test_refuses_unsupported_settings_and_names_each():

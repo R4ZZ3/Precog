@@ -46,7 +46,8 @@ def test_hooks_reset_per_request_and_replace_the_engine_copy():
     demand = _demand_stub()
     calls = []
     demand.copy = lambda cache, layer: calls.append(layer)
-    hooks = StripedDemandHooks(demand)
+    hooks = StripedDemandHooks(2, 4, 16)
+    hooks.demand = demand
     hooks.begin_request(3)
     assert not demand.choices.any() and not demand.counters.any()
     assert hooks.copy_missing(object(), 7) is True and calls == [7]

@@ -120,8 +120,14 @@ class StripedDemandHooks(DecodeHooks):
 
     single_request = False  # no per-request state: every miss reads the host
 
-    def __init__(self, demand: StripedDemand):
-        self.demand = demand
+    def __init__(self, num_layers: int, num_experts: int, stripes: int):
+        self.shape = (num_layers, num_experts, stripes)
+        self.demand: StripedDemand | None = None
+
+    def reserve(self, engine) -> None:
+        num_layers, num_experts, stripes = self.shape
+        # without a predictor no stage exists; one slot keeps the kernel's stage lookup trivial
+        self.demand = StripedDemand(num_layers, num_experts, stripes, stage_slots=1, device=engine.device)
 
     def bind(self, engine, cache) -> None:
         self.demand.check_cache(cache)
