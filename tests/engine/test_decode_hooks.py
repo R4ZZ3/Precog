@@ -17,7 +17,8 @@ from freetoken.moe.decode_hooks import DecodeHooks, charge_reservation
 
 
 def _cfg(**change):
-    cfg = dict(expert_predictor="some/predictor", moe_strategy="offload", moe_cpu_layers=None, max_running_req=1)
+    cfg = dict(expert_predictor="some/predictor", moe_strategy="offload", moe_cpu_layers=None, max_running_req=1,
+               moe_demand_copy_stripes=16)
     cfg.update(change)
     return SimpleNamespace(**cfg)
 
@@ -28,8 +29,9 @@ def test_no_flag_no_hooks():
 
 def test_refuses_unsupported_settings_and_names_each():
     with pytest.raises(ValueError) as err:
-        _load_decode_hooks(_cfg(moe_strategy="hybrid", moe_cpu_layers="8", max_running_req=4))
+        _load_decode_hooks(_cfg(moe_strategy="hybrid", moe_cpu_layers="8", max_running_req=4, moe_demand_copy_stripes=0))
     message = str(err.value)
+    assert "--moe-demand-copy-stripes 0" in message
     assert "--moe-strategy hybrid" in message
     assert "--moe-cpu-layers" in message
     assert "--max-running-requests 4" in message
@@ -121,6 +123,14 @@ def test_batch_of_two_is_refused():
         Engine._hooks_before_forward(_engine(), _Recorder(), _batch("decode", 1, size=2))
 
 
+def test_stateless_hooks_serve_batches_without_tracking():
+    hooks = _Recorder()
+    hooks.single_request = False
+    engine = _engine()
+    assert Engine._hooks_before_forward(engine, hooks, _batch("decode", 1, size=2)) is None
+    assert hooks.calls == [] and engine._hooks_uid is None
+
+
 class _Cache:
     decode_target = "gpu"
 
@@ -180,10 +190,11 @@ def _parse(*extra):
 def test_flags_default_off():
     args = _parse()
     assert args.expert_predictor is None and args.cuda_graph_node_priority is False
-    assert args.pretouch_host_banks is False
+    assert args.pretouch_host_banks is False and args.moe_demand_copy_stripes == 0
 
 
 def test_flags_parse():
-    args = _parse("--expert-predictor", "RASMUS/predictor", "--cuda-graph-node-priority", "--pretouch-host-banks")
+    args = _parse("--expert-predictor", "RASMUS/predictor", "--cuda-graph-node-priority", "--pretouch-host-banks",
+                  "--moe-demand-copy-stripes", "16")
     assert args.expert_predictor == "RASMUS/predictor" and args.cuda_graph_node_priority is True
-    assert args.pretouch_host_banks is True
+    assert args.pretouch_host_banks is True and args.moe_demand_copy_stripes == 16

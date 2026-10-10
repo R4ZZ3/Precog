@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 class DecodeHooks:
     """Default implementation: every callback is a no-op and the engine's own copy runs."""
 
+    # True: the hooks keep per-request state, so the engine refuses batches of more than one request
+    single_request = True
+
     def reserve(self, engine) -> None:
         """Allocate device memory before the cache is sized; the engine charges the bytes."""
 

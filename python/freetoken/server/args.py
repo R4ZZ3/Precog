@@ -690,6 +690,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-demand-copy-stripes",
+        type=int,
+        default=ServerArgs.moe_demand_copy_stripes,
+        help=(
+            "Copy decode cache misses with N CTAs per bank on a high-priority stream (16 measured fastest "
+            "on an RTX 4080). 0 keeps the fused copy. Needs every MoE layer pinned on the host."
+        ),
+    )
+
+    parser.add_argument(
         "--expert-predictor",
         default=ServerArgs.expert_predictor,
         help=(

@@ -789,6 +789,14 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        if self.decode_hooks is None and config.moe_demand_copy_stripes:
+            from freetoken.moe.striped_demand import StripedDemand, StripedDemandHooks
+
+            # without a predictor no stage exists; one slot keeps the kernel's stage lookup trivial
+            self.decode_hooks = StripedDemandHooks(StripedDemand(
+                num_layers=config.model_config.num_moe_layers, num_experts=cache.num_experts,
+                stripes=config.moe_demand_copy_stripes, stage_slots=1, device=self.device,
+            ))
         if self.decode_hooks is not None:
             cache.decode_hooks = self.decode_hooks
             self.decode_hooks.bind(self, cache)
@@ -1093,7 +1101,7 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        if hooks is not None and batch.is_decode:
+        if hooks is not None and consumed is not None:
             hooks.after_decode(self._hooks_step, consumed, next_tokens_gpu)
             self._hooks_step += 1
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
@@ -1102,9 +1110,14 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def _hooks_before_forward(self, hooks: DecodeHooks, batch: Batch) -> torch.Tensor | None:
-        """Track the request and decode step for the hooks; return the consumed token ids."""
+        """Track the request and decode step for the hooks; return the consumed token ids.
+
+        Hooks without per-request state also serve larger batches; they get no request or step calls.
+        """
         if batch.size != 1:
-            raise RuntimeError(f"--expert-predictor serves one request at a time, got a batch of {batch.size}")
+            if hooks.single_request:
+                raise RuntimeError(f"--expert-predictor serves one request at a time, got a batch of {batch.size}")
+            return None
         uid = batch.reqs[0].uid
         if batch.is_prefill or uid != self._hooks_uid:
             self._hooks_uid, self._hooks_step = uid, 0
@@ -1384,6 +1397,8 @@ def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
         problems.append("--moe-cpu-layers (every layer must decode on the GPU)")
     if config.max_running_req != 1:
         problems.append(f"--max-running-requests {config.max_running_req} (needs 1)")
+    if config.moe_demand_copy_stripes < 1:
+        problems.append("--moe-demand-copy-stripes 0 (the predictor's stage is read by the striped copy; 16 was measured)")
     if problems:
         raise ValueError("--expert-predictor cannot run with " + ", ".join(problems))
     try:
