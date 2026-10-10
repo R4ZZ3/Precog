@@ -711,6 +711,9 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+        from freetoken.moe.host_banks import set_pretouch
+
+        set_pretouch(config.pretouch_host_banks)
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -726,6 +729,8 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+        finally:
+            set_pretouch(False)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
             object.__setattr__(config, "moe_cache_size", size)

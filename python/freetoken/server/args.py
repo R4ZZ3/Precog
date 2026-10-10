@@ -698,6 +698,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--pretouch-host-banks",
+        action="store_true",
+        default=ServerArgs.pretouch_host_banks,
+        help=(
+            "Write every host expert bank once when it is allocated, before any checkpoint shard is read, "
+            "so the banks get their pages before the shard buffers. Commits the full bank size in RAM at start."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

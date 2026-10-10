@@ -56,6 +56,19 @@ _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
+# --pretouch-host-banks: write every mmap bank once at allocation (see set_pretouch)
+_pretouch = False
+
+
+def set_pretouch(enabled: bool) -> None:
+    """Make new mmap banks resident at allocation, before any checkpoint shard is read.
+
+    Loaders allocate all banks before reading shards, so the banks fault in first, in
+    allocation order, ahead of the transient shard buffers. On a WSL2 host, banks first
+    touched late in the load were measured about 1.5x slower per demand copy.
+    """
+    global _pretouch
+    _pretouch = enabled
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -112,6 +125,8 @@ class HostBank:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            if _pretouch:
+                ctypes.memset(self.addr, 0, asize)  # the values are overwritten by the fill
             self._pinned = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False

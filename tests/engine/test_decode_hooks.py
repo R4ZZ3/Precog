@@ -180,8 +180,10 @@ def _parse(*extra):
 def test_flags_default_off():
     args = _parse()
     assert args.expert_predictor is None and args.cuda_graph_node_priority is False
+    assert args.pretouch_host_banks is False
 
 
 def test_flags_parse():
-    args = _parse("--expert-predictor", "RASMUS/predictor", "--cuda-graph-node-priority")
+    args = _parse("--expert-predictor", "RASMUS/predictor", "--cuda-graph-node-priority", "--pretouch-host-banks")
     assert args.expert_predictor == "RASMUS/predictor" and args.cuda_graph_node_priority is True
+    assert args.pretouch_host_banks is True
