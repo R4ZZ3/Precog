@@ -679,12 +679,13 @@ def parse_args(
     parser.add_argument(
         "--expert-load",
         default=ServerArgs.expert_load,
-        choices=["auto", "serial", "parallel"],
+        choices=["auto", "serial", "parallel", "bounded"],
         help=(
             "How MoE expert banks are read into host RAM. 'auto' (default) reads scattered "
             "experts in parallel (fast) but falls back to serial when free RAM can't cover "
             "the banks + the parallel reader's extra whole-shard buffer; 'serial' forces the "
-            "low-memory reclaimable read (slower); 'parallel' forces the fast read."
+            "low-memory reclaimable read (slower); 'parallel' forces the fast read; 'bounded' is the "
+            "parallel read that copies tensors out and frees each shard, without read-ahead."
         ),
     )
 

@@ -590,7 +590,7 @@ class Engine:
                 device=self.device,
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
-                parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
+                parallel=_expert_parallel(config),
                 resident=True,
             )
         attach_resident_banks(layers, banks)
@@ -701,7 +701,7 @@ class Engine:
         # expert-tensor granularity. Both pin-after-fill.
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
-        expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        expert_parallel = _expert_parallel(config)
         requested_residency = None
         if split_residency:
             from freetoken.moe.host_banks import HostResidency
@@ -1363,6 +1363,14 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _expert_parallel(config: EngineConfig) -> bool | None:
+    """--expert-load -> load_expert_banks(parallel=...); 'bounded' is the parallel read with bounded memory."""
+    from freetoken.models.weight import set_bounded_reader
+
+    set_bounded_reader(config.expert_load == "bounded")
+    return {"serial": False, "parallel": True, "bounded": True}.get(config.expert_load, None)
 
 
 def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:

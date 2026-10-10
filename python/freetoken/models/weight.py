@@ -87,6 +87,10 @@ def iter_expert_tensors_parallel(
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
+    if _bounded_reader:
+        yield from iter_expert_tensors_bounded(model_path, is_expert, workers=workers, chunk=chunk,
+                                               drop_cache=drop_cache)
+        return
     from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
 
@@ -147,6 +151,116 @@ def iter_expert_tensors_parallel(
         th.join()
     if err:
         raise err[0]
+
+
+# --expert-load bounded: iter_expert_tensors_parallel reads through iter_expert_tensors_bounded
+_bounded_reader = False
+
+
+def set_bounded_reader(enabled: bool) -> None:
+    global _bounded_reader
+    _bounded_reader = enabled
+
+
+def expert_shard_order(shards: dict[str, list[str]], sizes: dict[str, int]) -> list[str]:
+    """Greedy shard order that keeps the bytes of partly read experts small.
+
+    An expert is complete when all its tensors have arrived; its key is the tensor name
+    without the last two components (``<...>.experts.<e>`` from ``<...>.gate_proj.weight``).
+    A checkpoint that stores, for example, every gate/up weight in the first shards and every
+    down weight in the last ones holds nearly all experts half-read in file order. The greedy
+    order applies only when every key has the same tensor count; any other naming (stacked
+    expert tensors, mixed layouts) keeps file order, which is correct but bounds memory less.
+    """
+    need: dict[str, int] = {}
+    for names in shards.values():
+        for name in names:
+            key = name.rsplit(".", 2)[0]
+            need[key] = need.get(key, 0) + 1
+    if len(set(need.values())) != 1 or min(need.values()) < 2:
+        return sorted(shards)
+
+    def pending_after(order: list[str]) -> tuple[int, int]:
+        got: dict[str, int] = {}
+        held: dict[str, int] = {}
+        peak = cur = 0
+        for shard in order:
+            for name in shards[shard]:
+                key = name.rsplit(".", 2)[0]
+                got[key] = got.get(key, 0) + 1
+                held[key] = held.get(key, 0) + sizes[name]
+                cur += sizes[name]
+                if got[key] == need[key]:
+                    cur -= held.pop(key)
+            peak = max(peak, cur)
+        return peak, cur
+
+    order: list[str] = []
+    rest = sorted(shards)
+    while rest:
+        best = min(rest, key=lambda shard: pending_after(order + [shard]))
+        order.append(best)
+        rest.remove(best)
+    return order
+
+
+def iter_expert_tensors_bounded(
+    model_path: str,
+    is_expert: Callable[[str], bool],
+    *,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    drop_cache: bool = True,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """``iter_expert_tensors_parallel`` with bounded host memory.
+
+    The parallel reader yields views into whole-shard buffers, so a consumer that groups
+    tensors per expert keeps a view into every shard until the expert's last tensor arrives:
+    on Qwen3.5-35B-A3B-FP8 committed memory reached 67-70 GB for 30 GiB of banks. This reader
+    copies each tensor out of the shard, unmaps the shard after its last tensor, reads in
+    ``expert_shard_order`` and reads no shard ahead. Peak extra memory is about one shard
+    buffer plus the pending bytes of partly read experts.
+    """
+    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.utils.hf import download_hf_weight
+
+    model_path = download_hf_weight(model_path)
+    shards: dict[str, list[str]] = {}
+    for name, shard in safetensors_weight_map(model_path).items():
+        if is_expert(name):
+            shards.setdefault(shard, []).append(name)
+    sizes: dict[str, int] = {}
+    for shard, names in shards.items():
+        with open(os.path.join(model_path, shard), "rb") as f:
+            hdr = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+        for name in names:
+            lo, hi = hdr[name]["data_offsets"]
+            sizes[name] = hi - lo
+    for shard in expert_shard_order(shards, sizes):
+        path = os.path.join(model_path, shard)
+        if drop_cache:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except OSError:
+                pass
+        buf = _read_shard_odirect_parallel(path, workers, chunk)
+        mv = memoryview(buf)
+        try:
+            n = struct.unpack("<Q", bytes(mv[:8]))[0]
+            hdr = json.loads(bytes(mv[8:8 + n]))
+            for name in shards[shard]:
+                meta = hdr[name]
+                lo, hi = meta["data_offsets"]
+                t = torch.frombuffer(mv[8 + n + lo: 8 + n + hi], dtype=_ST_DTYPE[meta["dtype"]]).clone()
+                yield name, (t.view(*meta["shape"]) if meta["shape"] else t)
+                del t
+        finally:
+            mv.release()
+            # every tensor was copied out; a BufferError here means a view escaped and the bound is broken
+            buf.close()
+        del buf
 
 
 _SCATTERED_AVG_BYTES = 16 << 20  # avg expert tensor below this -> "scattered" -> prefer parallel
