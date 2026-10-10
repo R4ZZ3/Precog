@@ -681,6 +681,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--expert-predictor",
+        default=ServerArgs.expert_predictor,
+        help=(
+            "Prefetch predicted experts into the GPU during decode. A local folder or Hugging Face "
+            "repo of a predictor for the served checkpoint. Needs the commitmoe-prefetch package, "
+            "--moe-strategy offload and --max-running-requests 1."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

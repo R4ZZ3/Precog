@@ -223,6 +223,8 @@ class OffloadMoeCache:
         # must be enabled before capture — see engine graph setup). The only graph artifact
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
+        # freetoken.moe.decode_hooks.DecodeHooks set by the engine before graph capture, or None
+        self.decode_hooks = None
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
         # the kernel, which accumulates in the same launch. The stat_* tensors below stay
         # for the hybrid path, whose kernel is still ours.

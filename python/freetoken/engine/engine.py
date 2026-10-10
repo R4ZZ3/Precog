@@ -21,6 +21,7 @@ from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe.decode_hooks import DecodeHooks, charge_reservation
 from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
@@ -396,6 +397,9 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self.decode_hooks = _load_decode_hooks(config)
+        self._hooks_uid: int | None = None
+        self._hooks_step = 0
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -651,6 +655,9 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        if self.decode_hooks is not None:
+            charged = charge_reservation(self, self.decode_hooks)
+            logger.info_rank0(f"--expert-predictor: {charged / 2**20:.1f} MiB charged to the weights before cache sizing")
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
@@ -776,6 +783,9 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        if self.decode_hooks is not None:
+            cache.decode_hooks = self.decode_hooks
+            self.decode_hooks.bind(self, cache)
         return cache
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
@@ -1060,6 +1070,9 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        hooks = self.decode_hooks
+        if hooks is not None:
+            consumed = self._hooks_before_forward(hooks, batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -1073,10 +1086,26 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if hooks is not None and batch.is_decode:
+            hooks.after_decode(self._hooks_step, consumed, next_tokens_gpu)
+            self._hooks_step += 1
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _hooks_before_forward(self, hooks: DecodeHooks, batch: Batch) -> torch.Tensor | None:
+        """Track the request and decode step for the hooks; return the consumed token ids."""
+        if batch.size != 1:
+            raise RuntimeError(f"--expert-predictor serves one request at a time, got a batch of {batch.size}")
+        uid = batch.reqs[0].uid
+        if batch.is_prefill or uid != self._hooks_uid:
+            self._hooks_uid, self._hooks_step = uid, 0
+            hooks.begin_request(uid)
+        if not batch.is_decode:
+            return None
+        hooks.before_decode(self._hooks_step)
+        return batch.input_ids.clone()
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1327,6 +1356,26 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
+    """Build the --expert-predictor hooks, or None; refuse settings the predictor does not serve."""
+    if config.expert_predictor is None:
+        return None
+    problems = []
+    if config.moe_strategy != "offload":
+        problems.append(f"--moe-strategy {config.moe_strategy} (needs offload)")
+    if config.moe_cpu_layers:
+        problems.append("--moe-cpu-layers (every layer must decode on the GPU)")
+    if config.max_running_req != 1:
+        problems.append(f"--max-running-requests {config.max_running_req} (needs 1)")
+    if problems:
+        raise ValueError("--expert-predictor cannot run with " + ", ".join(problems))
+    try:
+        from commitmoe_prefetch.freetoken import create_decode_hooks
+    except ImportError as exc:
+        raise RuntimeError("--expert-predictor needs the commitmoe-prefetch package") from exc
+    return create_decode_hooks(config.expert_predictor, config)
 
 
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:

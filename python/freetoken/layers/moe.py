@@ -235,7 +235,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._decode_routed(hidden_states, topk_weights, topk_ids, router_logits)
 
     def prefill_forward(
         self,
@@ -263,6 +263,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -282,8 +283,12 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        hooks = cache.decode_hooks
+        if hooks is not None:
+            hooks.observe(self.layer_id, hidden_states, router_logits, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+        if hooks is None or not hooks.copy_missing(cache, self.layer_id):
+            cache.copy_missing()
         return self._expert_gemm(
             cache,
             hidden_states,
