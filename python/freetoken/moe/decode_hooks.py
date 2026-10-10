@@ -26,8 +26,8 @@ class DecodeHooks:
         """Allocate device memory before the cache is sized; the engine charges the bytes."""
 
     def bind(self, engine, cache: OffloadMoeCache) -> None:
-        """Called after the offload cache exists and again after every cache rebuild, each time
-        before CUDA graph capture. Graph warmup and capture call ``observe`` and ``copy_missing``
+        """Called after the offload cache exists and again before every CUDA graph recapture
+        (after any cache rebuild), each time before the capture. Graph warmup and capture call ``observe`` and ``copy_missing``
         without any request or step callback, so bind must leave all device state valid."""
 
     def begin_request(self, uid: int) -> None:

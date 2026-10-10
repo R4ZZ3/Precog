@@ -1036,9 +1036,6 @@ class Engine:
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             self.moe_offload_cache.rebuild(moe_cache_size)
-            if self.decode_hooks is not None:
-                # the rebuild reallocated the copy descriptors and miss lists the hooks captured
-                self.decode_hooks.bind(self, self.moe_offload_cache)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
@@ -1057,6 +1054,11 @@ class Engine:
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+        if self.decode_hooks is not None and self.moe_offload_cache is not None:
+            # Before every recapture, not only after an expert-cache resize: a cache rebuild
+            # reallocates the copy descriptors and miss lists, and every recapture runs dummy
+            # forwards that must start from the hooks' reset state, not the last request's.
+            self.decode_hooks.bind(self, self.moe_offload_cache)
         gc.collect()
         free_min = self._sync_get_memory()[0]
         self.graph_runner = GraphRunner(
