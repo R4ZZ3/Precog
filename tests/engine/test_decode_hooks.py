@@ -165,3 +165,23 @@ def test_layer_order_when_hook_copies():
 
 def test_layer_without_hooks_is_unchanged():
     assert _decode(None) == [("ensure", 3), ("engine copy",)]
+
+
+def _parse(*extra):
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3VLForConditionalGeneration"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
+        return parse_args(["--model", "/models/anon", *extra])[0]
+
+
+def test_flags_default_off():
+    args = _parse()
+    assert args.expert_predictor is None and args.cuda_graph_node_priority is False
+
+
+def test_flags_parse():
+    args = _parse("--expert-predictor", "RASMUS/predictor", "--cuda-graph-node-priority")
+    assert args.expert_predictor == "RASMUS/predictor" and args.cuda_graph_node_priority is True

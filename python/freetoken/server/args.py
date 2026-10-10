@@ -377,6 +377,13 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--cuda-graph-node-priority",
+        action="store_true",
+        default=ServerArgs.cuda_graph_node_priority,
+        help="Instantiate decode CUDA graphs with per-node priorities, so captured high-priority streams keep their priority on replay.",
+    )
+
+    parser.add_argument(
         "--num-tokenizer",
         "--tokenizer-count",
         type=int,

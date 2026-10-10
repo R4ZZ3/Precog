@@ -10,6 +10,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
+from .priority_graph import PriorityGraph
 
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
@@ -117,6 +118,7 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
+        node_priority: bool = False,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -129,6 +131,7 @@ class GraphRunner:
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
         self.mrope = mrope
+        self.node_priority = node_priority
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -174,7 +177,7 @@ class GraphRunner:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
-            graph = torch.cuda.CUDAGraph()
+            graph = PriorityGraph() if self.node_priority else torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)

@@ -72,6 +72,7 @@ class EngineConfig:
     moe_hybrid_max_fetch: int = -1
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
+    cuda_graph_node_priority: bool = False  # instantiate decode graphs with per-node priorities
     page_size: int = 1
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
