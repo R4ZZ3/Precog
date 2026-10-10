@@ -514,7 +514,6 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
-            node_priority=config.cuda_graph_node_priority,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1078,7 +1077,6 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
-            node_priority=config.cuda_graph_node_priority,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
