@@ -15,7 +15,9 @@ from safetensors.torch import save_file
 from freetoken.models import weight
 from freetoken.models.weight import expert_shard_order, iter_expert_tensors_bounded, iter_expert_tensors_parallel
 
-QWEN_FP8 = "/mnt/e/hf_data/hub/models--Qwen--Qwen3.5-35B-A3B-FP8/snapshots/9d1823d2dee688a6b25e77009dc727688c44936e"
+# A local snapshot of Qwen/Qwen3.5-35B-A3B-FP8 at revision 9d1823d2dee688a6b25e77009dc727688c44936e.
+# The checkpoint test skips when FREETOKEN_TEST_QWEN35_FP8_DIR is unset.
+QWEN_FP8 = os.environ.get("FREETOKEN_TEST_QWEN35_FP8_DIR", "")
 # Logged by the EXP513 server (2026-10-10) for that checkpoint: the order the measured runs read in.
 EXP513_ORDER = [f"model.safetensors-{i:05d}-of-00014.safetensors" for i in (13, 8, 9, 1, 2, 10, 3, 4, 11, 5, 6, 12, 7)]
 
