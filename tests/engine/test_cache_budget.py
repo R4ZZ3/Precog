@@ -293,6 +293,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        num_page_override = None
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -336,6 +337,20 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+    # --num-pages with --moe-cache-auto: the plan must leave room for the fixed pages. Slots of
+    # 1.1 MB against an 8 MB budget leave under 1.1 MB unplanned, less than 20 pages need.
+    fixed_pages = StubConfig()
+    fixed_pages.moe_prefill_overlap = False  # floor of 4 slots, not 8, so the budget binds
+    big = StubBanks()
+    big.sources = {"w": [torch.zeros(4, 550_000, dtype=torch.float16)] * 2}
+    per_slot = expert_bytes_per_slot(big.sources)
+    budget = int(0.9 * 10_000_000) - 1_000_000 - fixed
+    size, _, _ = engine._resolve_auto_moe_cache_size(fixed_pages, big)
+    assert size * per_slot + 20 * cache_per_page > budget  # without the override: overcommits
+    fixed_pages.num_page_override = 20
+    size, pages, _ = engine._resolve_auto_moe_cache_size(fixed_pages, big)
+    assert pages >= 20 and size * per_slot + 20 * cache_per_page <= budget
 
 
 # ---------------------------------------------------------------------------

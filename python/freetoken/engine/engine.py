@@ -639,6 +639,10 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        if config.num_page_override is not None:
+            # --num-pages is kept after the plan, so the experts may only take what those pages leave
+            kv_reserve_tokens = config.num_page_override * page_tokens
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -649,7 +653,7 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
