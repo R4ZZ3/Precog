@@ -2,7 +2,8 @@
 
 This branch is a fork of [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0) at
 commit 2d8b9cc. It adds engine options for expert offloading and an optional learned expert
-predictor. All changes are flags. Without them, the engine behaves as FreeToken 2d8b9cc.
+predictor. The new offload and predictor features are opt-in flags. The fork also fixes the automatic
+cache budget (`--moe-cache-auto` with `--num-pages`).
 
 The predictor supports one model only: `Qwen/Qwen3.5-35B-A3B-FP8`. The engine flags work with any
 model that FreeToken serves with `--moe-strategy offload`, but we measured them only on this model.
@@ -95,7 +96,7 @@ Decode tokens/s, the median over the 10 prompts of a domain:
 | Summarization (CNN/DailyMail) | 32.2 | 60.7 | 61.0 |
 
 - The fork without the predictor was faster than upstream on all 50 prompts. Per domain, the median of
-  the per-prompt speed ratios was 1.80x to 1.95x.
+  the per-prompt speed ratios was 1.80x to 1.95x. Per prompt, the ratio was 1.69x to 2.06x.
 - The predictor gave about 1% lower decode time per token on coding and math (faster on 9 of 10
   prompts in each). On chat, Finnish and summarization, we detected no clear difference. These effects
   are small, and we did not repeat them on independent servers.
