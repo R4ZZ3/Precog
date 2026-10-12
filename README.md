@@ -10,6 +10,36 @@
 | <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/issues/482"><b>Community WeChat</b></a> |
 </p>
 
+> [!NOTE]
+> **This is a fork of [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0) at commit 2d8b9cc.**
+> It adds faster expert offloading and an optional learned expert predictor for
+> `Qwen/Qwen3.5-35B-A3B-FP8`. The new offload and predictor features are opt-in flags. The fork also fixes
+> the automatic cache budget (`--moe-cache-auto` with `--num-pages`).
+> The FreeToken team did not make or review this fork.
+
+## This fork: CommitMoE expert prefetch
+
+<div align="center">
+  <a href="docs/media/commitmoe-story.mp4">
+    <img alt="Video: how this fork came about and what it measured (110 s)" src="docs/media/commitmoe-story-poster.jpg" width=80%>
+  </a>
+  <br><sub>Video (110 s): how this work came about and what we measured. Select the image to play it.</sub>
+</div>
+
+On one RTX 4080 16 GB under WSL2 with `Qwen/Qwen3.5-35B-A3B-FP8`, one 256-token request at a time and at
+the same configured memory budget, this fork decoded faster than upstream FreeToken 2d8b9cc on all 50
+prompts of five domains (coding, math, chat, Finnish, summarization). The median speed-up per domain
+was 1.80x to 1.95x; per prompt it was 1.69x to 2.06x. The median over the 50 prompts was 32.4 tokens/s
+upstream, 61.1 tokens/s with the fork, and 61.3 tokens/s with the fork and the predictor. With the
+predictor, we observed about 1% lower decode time on coding and math, and no clear difference on the
+other domains. These small predictor effects need repeated runs on independent servers.
+
+The flags, the install, the run command, the limits and the full benchmark are in
+[docs/expert-predictor.md](docs/expert-predictor.md). The predictor weights are on Hugging Face:
+[RASMUS/qwen3.5-35b-a3b-fp8-expert-predictor](https://huggingface.co/RASMUS/qwen3.5-35b-a3b-fp8-expert-predictor).
+
+The rest of this README is upstream FreeToken's.
+
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
