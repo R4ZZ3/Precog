@@ -641,8 +641,9 @@ class Engine:
         total_experts = config.model_config.num_moe_layers * num_experts
         kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
         if config.num_page_override is not None:
-            # --num-pages is kept after the plan, so the experts may only take what those pages leave
-            kv_reserve_tokens = config.num_page_override * page_tokens
+            # --num-pages is kept after the plan, so the experts may only take what those pages leave;
+            # min_reserve stays a floor (DSV4 adds its working set and drift slack there)
+            kv_reserve_tokens = max(config.num_page_override * page_tokens, min_reserve)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
