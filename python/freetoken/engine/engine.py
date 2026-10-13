@@ -1387,6 +1387,23 @@ def _expert_parallel(config: EngineConfig) -> bool | None:
 
 
 def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
+    """The decode hooks, wrapped in the routing recorder when FREETOKEN_ROUTING_RECORD_DIR is set.
+
+    The recorder is a research diagnostic (routing_recorder.py). It needs hooks to wrap, so it
+    refuses to run when neither --expert-predictor nor --moe-demand-copy-stripes is set.
+    """
+    hooks = _build_decode_hooks(config)
+    out_dir = os.environ.get("FREETOKEN_ROUTING_RECORD_DIR")
+    if not out_dir:
+        return hooks
+    if hooks is None:
+        raise ValueError("FREETOKEN_ROUTING_RECORD_DIR needs --expert-predictor or --moe-demand-copy-stripes")
+    from freetoken.moe.routing_recorder import RoutingRecorder
+
+    return RoutingRecorder(hooks, out_dir, top_k=config.model_config.num_experts_per_tok)
+
+
+def _build_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
     """Build the --expert-predictor or --moe-demand-copy-stripes hooks, or None.
 
     Refuses settings the predictor does not serve. The hooks exist before the offload cache,
