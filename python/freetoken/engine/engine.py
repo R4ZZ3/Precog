@@ -1387,19 +1387,27 @@ def _expert_parallel(config: EngineConfig) -> bool | None:
 
 
 def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
-    """The decode hooks, wrapped in the routing recorder when FREETOKEN_ROUTING_RECORD_DIR is set.
+    """The decode hooks, optionally wrapped by a research diagnostic (routing_recorder.py).
 
-    The recorder is a research diagnostic (routing_recorder.py). It needs hooks to wrap, so it
-    refuses to run when neither --expert-predictor nor --moe-demand-copy-stripes is set.
+    FREETOKEN_ROUTING_RECORD_DIR wraps them in the routing recorder. FREETOKEN_PROFILE_REQUESTS
+    (comma-separated request indexes) wraps them in a profiler window for nsys. Both need hooks
+    to wrap, so they refuse to run when neither --expert-predictor nor
+    --moe-demand-copy-stripes is set.
     """
     hooks = _build_decode_hooks(config)
     out_dir = os.environ.get("FREETOKEN_ROUTING_RECORD_DIR")
-    if not out_dir:
+    profile = os.environ.get("FREETOKEN_PROFILE_REQUESTS")
+    if not out_dir and not profile:
         return hooks
     if hooks is None:
-        raise ValueError("FREETOKEN_ROUTING_RECORD_DIR needs --expert-predictor or --moe-demand-copy-stripes")
-    from freetoken.moe.routing_recorder import RoutingRecorder
+        raise ValueError("FREETOKEN_ROUTING_RECORD_DIR and FREETOKEN_PROFILE_REQUESTS need "
+                         "--expert-predictor or --moe-demand-copy-stripes")
+    if out_dir and profile:
+        raise ValueError("record the routing and profile in separate runs: the recorder adds device work")
+    from freetoken.moe.routing_recorder import ProfileWindow, RoutingRecorder
 
+    if profile:
+        return ProfileWindow(hooks, frozenset(int(x) for x in profile.split(",")))
     return RoutingRecorder(hooks, out_dir, top_k=config.model_config.num_experts_per_tok)
 
 

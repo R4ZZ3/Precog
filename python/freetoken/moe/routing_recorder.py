@@ -156,3 +156,57 @@ class RoutingRecorder(DecodeHooks):
         torch.save(record, path)
         self.sequence += 1
 
+
+
+class ProfileWindow(DecodeHooks):
+    """Forward every callback to ``inner``; profile only the chosen requests (EXP519 part A).
+
+    Requests are counted when they reach decode step 0 (0 = the first request that decodes), so
+    a prefill-only warmup can never shift the count. The profiler range (cudaProfilerStart/Stop,
+    for ``nsys --capture-range=cudaProfilerApi``) covers the decode of a chosen request: it opens
+    before its step 0 and closes when the next request begins. The wrapper adds no device work:
+    graph replays do not call Python.
+    """
+
+    def __init__(self, inner: DecodeHooks, requests: frozenset[int]):
+        self.inner = inner
+        self.single_request = inner.single_request
+        self.requests = requests
+        self.uid: int | None = None
+        self.index = -1
+        self.open = False
+
+    def reserve(self, engine) -> None:
+        self.inner.reserve(engine)
+
+    def bind(self, engine, cache) -> None:
+        self.inner.bind(engine, cache)
+
+    def begin_request(self, uid: int) -> None:
+        if uid != self.uid:
+            self.uid = uid
+            if self.open:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.stop()
+                self.open = False
+        self.inner.begin_request(uid)
+
+    def before_decode(self, step: int) -> None:
+        if step == 0:
+            self.index += 1
+            if self.index in self.requests:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.start()
+                self.open = True
+                logger.info("profile window: request index %d (uid %s) opened", self.index, self.uid)
+        self.inner.before_decode(step)
+
+    def after_decode(self, step: int, consumed: torch.Tensor, sampled: torch.Tensor) -> None:
+        self.inner.after_decode(step, consumed, sampled)
+
+    def observe(self, layer_id: int, hidden: torch.Tensor, router_logits: torch.Tensor | None,
+                topk_ids: torch.Tensor) -> None:
+        self.inner.observe(layer_id, hidden, router_logits, topk_ids)
+
+    def copy_missing(self, cache, layer_id: int) -> bool:
+        return self.inner.copy_missing(cache, layer_id)

@@ -153,3 +153,23 @@ def test_wrong_routed_shape_is_refused(tmp_path):
     rec.bind(None, make_cache())
     with pytest.raises(RuntimeError, match="routed ids"):
         rec.observe(0, torch.zeros(2, 4), None, torch.zeros((2, K), dtype=torch.int64))
+
+
+def test_profile_window_opens_and_closes_around_chosen_requests(monkeypatch):
+    from freetoken.moe.routing_recorder import ProfileWindow
+
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda.profiler, "start", lambda: events.append("start"))
+    monkeypatch.setattr(torch.cuda.profiler, "stop", lambda: events.append("stop"))
+    inner = FakeInner(with_probs=False)
+    window = ProfileWindow(inner, frozenset({1, 2}))
+    window.begin_request(9)  # a prefill-only warmup: never decodes, never counted
+    for uid in (10, 11, 12, 13):
+        window.begin_request(uid)
+        window.begin_request(uid)  # a second prefill chunk of the same request
+        window.before_decode(0)
+        window.before_decode(1)
+        events.append(f"uid{uid}")
+    assert events == ["uid10", "start", "uid11", "stop", "start", "uid12", "stop", "uid13"]
+    assert window.copy_missing(None, 0) is True and inner.calls[-1] == ("copy_missing", 0)
