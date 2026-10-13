@@ -18,14 +18,19 @@ Enabled by the environment variable FREETOKEN_ROUTING_RECORD_DIR; see engine._lo
 """
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import torch
 
 from freetoken.moe.decode_hooks import DecodeHooks
+from freetoken.utils import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
+
+SCHEMA = 1
+# scores[r] are the predictor scores the forward of decode step r used: computed at its layer 0
+# from the inputs frozen after step r - 1. Row 0 scores reset (zero) inputs and forecasts nothing.
+SCORE_CLOCK = "scores[r]: used by decode step r, computed from inputs frozen after step r-1; row 0 has reset inputs"
 
 
 class RoutingRecorder(DecodeHooks):
@@ -53,11 +58,16 @@ class RoutingRecorder(DecodeHooks):
         self.inner.reserve(engine)
 
     def bind(self, engine, cache) -> None:
+        # A rebind means a graph recapture, maybe after a cache rebuild, which keeps the cache
+        # object but replaces its tensors and can change its size. Once a request was recorded,
+        # the recorded geometry would no longer describe the cache, and the inner bind would reset
+        # the live counters before the export: refuse. Before that, reallocate for the new geometry.
+        # The check runs before inner.bind, so that the inner hooks see no partial bind.
+        if self.uid is not None:
+            raise RuntimeError("routing recorder: the engine rebound the hooks (graph recapture or cache rebuild) "
+                               "after recording started; the recording is no longer valid")
         self.inner.bind(engine, cache)
-        if self.cache is None:
-            self._allocate(cache)
-        elif self.cache is not cache:
-            raise RuntimeError("routing recorder: the offload cache was rebuilt; the recorded geometry is no longer valid")
+        self._allocate(cache)
         self.row.fill_(self.capacity)  # graph warmup and capture write to the scratch row
 
     def _allocate(self, cache) -> None:
@@ -110,6 +120,9 @@ class RoutingRecorder(DecodeHooks):
             self.scores[step].copy_(self.inner.probs)
         self.inner.after_decode(step, consumed, sampled)
         self.steps = step + 1
+        # Only observes between before_decode and after_decode write a real row; any other
+        # observe (a stray capture or warmup forward) goes to the scratch row.
+        self.row.fill_(self.capacity)
 
     # -- inside the decode graph ---------------------------------------------------
 
@@ -136,7 +149,12 @@ class RoutingRecorder(DecodeHooks):
     def _export(self) -> None:
         n = min(self.steps, self.capacity)
         demand = getattr(self.inner, "demand", None)
+        cache = self.cache
         record = {
+            "schema": SCHEMA,
+            "geometry": dict(layers=cache.num_layers, experts=cache.num_experts, top_k=self.top_k,
+                             slots=cache.cache_size, capacity=self.capacity),
+            "score_clock": SCORE_CLOCK,
             "uid": self.uid,
             "sequence": self.sequence,
             "steps": self.steps,

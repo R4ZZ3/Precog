@@ -98,6 +98,7 @@ def test_records_raw_ids_residency_snapshot_and_counters(tmp_path):
     [path] = files(tmp_path)
     record = torch.load(path)
     assert (record["uid"], record["sequence"], record["steps"], record["overflow"]) == (7, 0, 2, False)
+    assert record["schema"] == 1 and record["geometry"] == dict(layers=L, experts=E, top_k=K, slots=S, capacity=4)
     assert record["ids"].tolist() == [[[1, 2], [5, 6], [3, 4]], [[2, 1], [0, 5], [3, 4]]]
     assert record["hits"].tolist() == [[[True, False], [True, False], [False, False]],
                                        [[True, True], [False, True], [False, False]]]
@@ -116,9 +117,8 @@ def test_warmup_rows_never_exported_and_new_request_starts_clean(tmp_path):
     rec.bind(None, cache)
     rec.begin_request(1)
     decode_step(rec, 0, [(1, 1), (1, 1), (1, 1)])
-    rec.bind(None, cache)  # recapture between requests: its warmup writes go to the scratch row
-    rec.observe(2, torch.zeros(1, 4), None, ids(15, 15))
-    assert rec.ids[-1, 2].tolist() == [15, 15]  # the scratch row took the warmup write
+    rec.observe(2, torch.zeros(1, 4), None, ids(15, 15))  # a stray capture-time write
+    assert rec.ids[-1, 2].tolist() == [15, 15]  # went to the scratch row
     rec.begin_request(2)
     decode_step(rec, 0, [(3, 3), (3, 3), (3, 3)])
     rec.begin_request(3)
@@ -141,11 +141,19 @@ def test_overflow_steps_go_to_scratch_and_are_flagged(tmp_path):
     assert record["scores"][:, 0, 0].tolist() == [1.0, 2.0]
 
 
-def test_rebuilt_cache_is_refused(tmp_path):
-    rec = RoutingRecorder(FakeInner(with_probs=False), tmp_path, top_k=K)
+def test_rebind_before_recording_reallocates_and_after_recording_is_refused(tmp_path):
+    inner = FakeInner(with_probs=False)
+    rec = RoutingRecorder(inner, tmp_path, top_k=K)
     rec.bind(None, make_cache())
-    with pytest.raises(RuntimeError, match="rebuilt"):
-        rec.bind(None, make_cache())
+    bigger = make_cache()
+    bigger.cache_size, bigger.id_of_slot, bigger.usage = 12, torch.arange(12, dtype=torch.int32), torch.zeros(12, dtype=torch.int64)
+    rec.bind(None, bigger)  # startup recapture: no request recorded yet
+    assert rec.snap_usage.shape == (12,)
+    rec.begin_request(1)
+    binds = inner.calls.count(("bind",))
+    with pytest.raises(RuntimeError, match="rebound"):
+        rec.bind(None, bigger)
+    assert inner.calls.count(("bind",)) == binds  # refused before the inner bind ran
 
 
 def test_wrong_routed_shape_is_refused(tmp_path):
