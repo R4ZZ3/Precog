@@ -215,6 +215,9 @@ class PrefetchHooks(DecodeHooks):
     def begin_request(self, uid: int) -> None:
         if uid != self.uid and self.steps:
             logger.info('expert predictor: request %s, %d decode steps: %s', self.uid, self.steps, self.summary())
+            # Decode misses (stage + host) of every layer, for per-layer comparisons (EXP526).
+            per_layer = self.demand.counters[:, :2].sum(1).tolist()
+            logger.info('expert predictor: request %s, misses per layer: %s', self.uid, per_layer)
             if self.timing is not None and self.stamp_rows:
                 torch.save(dict(stamps=torch.stack(self.stamp_rows).cpu(), step=torch.tensor(self.stamp_steps),
                                 start_layer=self.learned.start_layer), self.timing)
