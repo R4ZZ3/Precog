@@ -31,7 +31,7 @@ BUNDLE = Path(os.environ.get('EXP526_EVICT_BUNDLE', '/nonexistent'))
 STEPS = 5
 
 
-def _hooks(start_layer: int):
+def _hooks(start_layer: int, timing: Path | None = None):
     from commitmoe_prefetch import bank_loader
     from commitmoe_prefetch import freetoken as ft
     from test_gpu_schedule import PUBLISHED
@@ -39,7 +39,8 @@ def _hooks(start_layer: int):
     if not BUNDLE.is_file():
         pytest.skip('eviction bundle absent')
     cfg, state = bank_loader.load(PUBLISHED)
-    hooks = ft.PrefetchHooks(cfg, state, demand_stripes=16, evict=(BUNDLE, start_layer))
+    hooks = ft.PrefetchHooks(cfg, state, demand_stripes=16, evict=(BUNDLE, start_layer),
+                         timing=timing)
     hooks.reserve(SimpleNamespace(device=torch.device('cuda')))
     cache, hosts = _cache()
     hooks.bind(None, cache)
@@ -100,6 +101,31 @@ def test_live_rule_in_graph(start_layer):
         assert events > 0 and reranked > 0 and rescued > 0, rule.counters
         summary = hooks.summary()
         assert summary['evict_events_scored'] == events
+
+
+def test_timing_stamps(tmp_path):
+    """The J diagnostic: per token, main's stamps rise layer by layer and the ready stamp exists."""
+    out = tmp_path / 'stamps.pt'
+    hooks, cache, _ = _hooks(L - 1, timing=out)
+    inputs = _Inputs()
+    graph = _capture(hooks, cache, inputs)
+    generator = torch.Generator().manual_seed(3)
+    for uid in (1, 2):
+        hooks.begin_request(uid)
+        for step in range(3):
+            inputs.draw(generator)
+            hooks.before_decode(step)
+            graph.replay()
+            hooks.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
+    torch.cuda.synchronize()
+    assert len(torch.load(out)['step']) == 3  # request 2 is written only when a third request begins
+    hooks.begin_request(3)
+    rows = torch.load(out)
+    stamps = rows['stamps']
+    assert stamps.shape == (6, L + 1) and rows['step'].tolist() == [0, 1, 2, 0, 1, 2]
+    assert rows['start_layer'] == L - 1
+    assert bool((stamps[:, 1:L] >= stamps[:, :L - 1]).all())  # main reaches the layers in order
+    assert bool((stamps[:, L] >= stamps[:, 0]).all())  # scores are ready after the fork at layer 0
 
 
 def test_flag_from_env():

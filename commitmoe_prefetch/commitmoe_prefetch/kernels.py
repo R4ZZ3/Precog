@@ -47,6 +47,16 @@ def capture_layer(H, RL, ROUTES, HIDDEN, LOGITS, IDS, LAYER: tl.constexpr, KEEP_
 
 
 @triton.jit
+def stamp(OUT, IDX: tl.constexpr):
+    """OUT[IDX] = the GPU global timer (ns) when this kernel runs on its stream. Diagnostic only.
+
+    The asm needs one input operand to give the result its shape; the zero is not read."""
+    z = tl.zeros([1], tl.int32)
+    t = tl.inline_asm_elementwise('mov.u64 $0, %globaltimer;', '=l,r', [z], dtype=tl.int64, is_pure=False, pack=1)
+    tl.store(OUT + IDX + tl.arange(0, 1), t)
+
+
+@triton.jit
 def phase(BUSY, LAYER, N, L: tl.constexpr, CLEAR: tl.constexpr = False):
     """Tell the pump which layer the demand copy serves and whether it copies now.
 
