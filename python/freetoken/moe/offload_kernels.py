@@ -24,7 +24,16 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
+
+    With ``cache.learned_evict`` set (decode hooks with a learned eviction head), the victims
+    come from ``learned_ensure`` instead; it writes the same maps and plan.
     """
+    rule = cache.learned_evict
+    if rule is not None:
+        from freetoken.moe.learned_evict import learned_ensure
+
+        learned_ensure(cache, layer_id, expert_ids, rule)
+        return
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
