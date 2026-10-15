@@ -33,6 +33,7 @@ Learned eviction (EXP526, off by default; on when FREETOKEN_LEARNED_EVICT names 
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -69,11 +70,14 @@ LIVE = ('h', 'rl', 'routes', 'prev')  # per-layer features of the current and pr
 # Learned eviction switch: a bundle path (exp526_export_evict.py) and the first layer J whose
 # ensure uses the keep scores. J has no default: it must come from the measured scores-ready wait.
 EVICT_ENV, EVICT_START_ENV = 'FREETOKEN_LEARNED_EVICT', 'FREETOKEN_LEARNED_EVICT_START'
-# Diagnostic for choosing J (EXP526): a .pt path. Main stamps the GPU timer at every observe(L) and
-# the probe stamps it when the keep scores are ready (column num_layers). After every request the
-# rows of all tokens so far are written there when the next request begins (so the last request
-# of a run is not written). Adds one tiny kernel per layer: not for speed runs.
-EVICT_TIMING_ENV = 'FREETOKEN_LEARNED_EVICT_TIMING'
+# Diagnostic for choosing J (EXP526): a .pt path. Per token, the GPU timer (ns) is stamped in
+# columns: num_layers = the probe, right before it records the scores-ready event; num_layers + 1 =
+# main at layer J right before its wait; num_layers + 2 = main right after the wait (the exposed
+# wait is column +2 minus column +1). With EVICT_TIMING_ALL_ENV=1, columns 0..num_layers-1 also
+# hold main's arrival at every observe(L), to screen candidate J values in one run (those 40 extra
+# kernels slow main down: confirm the chosen J with the plain timing). The rows of all tokens so
+# far are written when the next request begins, so the last request of a run is not written.
+EVICT_TIMING_ENV, EVICT_TIMING_ALL_ENV = 'FREETOKEN_LEARNED_EVICT_TIMING', 'FREETOKEN_LEARNED_EVICT_TIMING_ALL'
 
 
 class PrefetchHooks(DecodeHooks):
@@ -82,7 +86,8 @@ class PrefetchHooks(DecodeHooks):
     single_request = True
 
     def __init__(self, cfg: PredictorConfig, state: dict[str, torch.Tensor], demand_stripes: int,
-                 evict: tuple[Path, int] | None = None, timing: Path | None = None):
+                 evict: tuple[Path, int] | None = None, timing: Path | None = None, timing_all: bool = False,
+                 release_sha256: str | None = None):
         base, feats = cfg.base_model, cfg.features
         layers, sl = base.num_layers, kernels.SECTION_LAYERS
         targets = cfg.target_layers
@@ -114,7 +119,8 @@ class PrefetchHooks(DecodeHooks):
             - set(feats.router_logit_layers_zeroed)
         self.uid: int | None = None
         self.steps = 0
-        self.evict_cfg, self.timing = evict, timing
+        self.evict_cfg, self.timing, self.timing_all = evict, timing, timing_all
+        self.release_sha256 = release_sha256
         self.stamp_rows: list[torch.Tensor] = []
         self.stamp_steps: list[int] = []
         self.learned: LearnedEvict | None = None
@@ -164,7 +170,7 @@ class PrefetchHooks(DecodeHooks):
         if self.evict_cfg is not None:
             path, start = self.evict_cfg
             self.evict = EvictRows(path, list(cfg.target_layers), cfg.architecture.up_dim, E,
-                                   cfg.serving_reference.int8_group, dev)
+                                   cfg.serving_reference.int8_group, dev, self.release_sha256)
             M = len(self.evict.layers)
             target_of_layer = torch.full((L,), -1, dtype=torch.int32)
             target_of_layer[self.evict.layers] = torch.arange(M, dtype=torch.int32)
@@ -173,7 +179,9 @@ class PrefetchHooks(DecodeHooks):
                                         target_of_layer=target_of_layer.to(dev), start_layer=start,
                                         counters=torch.zeros(len(EVICT_COUNTERS), dtype=torch.int64, device=dev))
             self.scores_ready = torch.cuda.Event()
-            self.stamps = torch.zeros(L + 1, dtype=torch.int64, device=dev)
+            self.stamps = torch.zeros(L + 3, dtype=torch.int64, device=dev)
+            # Tokens whose keep scores were not all finite (published with valid = 0, so LRU).
+            self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
             logger.info('learned eviction: layers %s from layer %d, rows %.1f MiB (%s)', self.evict.layers,
                         start, self.evict.nbytes / 2**20, path)
         logger.info('expert predictor: %d heads L%02d-L%02d, int8 bank %.1f MiB, stage %d MiB, caps %s',
@@ -237,6 +245,7 @@ class PrefetchHooks(DecodeHooks):
             self.learned.keep.zero_()
             self.learned.valid.zero_()
             self.learned.counters.zero_()
+            self.nonfinite_tokens.zero_()
 
     def before_decode(self, step: int) -> None:
         self.step.fill_(step)
@@ -285,7 +294,8 @@ class PrefetchHooks(DecodeHooks):
         if self.learned is None:
             return
         main = torch.cuda.current_stream()
-        if self.timing is not None:
+        L = self.cfg.base_model.num_layers
+        if self.timing_all:
             kernels.stamp[(1,)](self.stamps, IDX=layer_id)
         if layer_id == 0:
             # The scores read only the frozen end-of-token-t inputs, never this capture.
@@ -293,7 +303,11 @@ class PrefetchHooks(DecodeHooks):
             with torch.cuda.stream(self.probe_stream):
                 self._score()
         if layer_id == self.learned.start_layer:
+            if self.timing is not None:
+                kernels.stamp[(1,)](self.stamps, IDX=L + 1)
             main.wait_event(self.scores_ready)
+            if self.timing is not None:
+                kernels.stamp[(1,)](self.stamps, IDX=L + 2)
 
     def _score(self) -> None:
         """Score every head from the end-of-token-t inputs and advance the EMA prior.
@@ -317,12 +331,18 @@ class PrefetchHooks(DecodeHooks):
             self.probs.copy_(self.bank(raw))
         else:
             g = self.bank.trunk(raw)
-            self.evict(g, self.learned.keep)
-            # Step 0 scores come from the reset zeros (no token decoded yet): never valid.
-            self.learned.valid.copy_((self.step > 0).to(torch.int32))
-            self.scores_ready.record()
+            keep = self.learned.keep
+            self.evict(g, keep)
+            # Step 0 scores come from the reset zeros (no token decoded yet): never valid. A
+            # non-finite score would break the victim kernel's selection (learned_evict
+            # contracts): that token falls back to LRU and is counted.
+            finite = torch.isfinite(keep).all()
+            scored = self.step[0] > 0
+            self.learned.valid.copy_((scored & finite).to(torch.int32).view(1))
+            self.nonfinite_tokens.add_((scored & ~finite).to(torch.int64))
             if self.timing is not None:
                 kernels.stamp[(1,)](self.stamps, IDX=self.cfg.base_model.num_layers)
+            self.scores_ready.record()
             self.probs.copy_(self.bank.head(g))
         prior = raw['prior_before']
         before = prior.clone()
@@ -380,6 +400,7 @@ class PrefetchHooks(DecodeHooks):
                    unscored_token_ids=int(self.unscored_ids))
         if self.learned is not None:
             out.update(zip(('evict_' + c for c in EVICT_COUNTERS), self.learned.counters.tolist()))
+            out['evict_nonfinite_tokens'] = int(self.nonfinite_tokens)
         return out
 
 
@@ -394,8 +415,9 @@ def create_decode_hooks(source: str, config: EngineConfig) -> PrefetchHooks:
     logger.info('expert predictor %s: trained on %s@%s; the served checkpoint is checked by shape only',
                 source, cfg.base_model.repo_id, cfg.base_model.revision[:12])
     timing = os.environ.get(EVICT_TIMING_ENV)
+    release = json.loads((folder / 'manifest.json').read_text())['files']['model.safetensors']  # verified above
     return PrefetchHooks(cfg, state, config.moe_demand_copy_stripes, evict_from_env(os.environ),
-                         Path(timing) if timing else None)
+                         Path(timing) if timing else None, os.environ.get(EVICT_TIMING_ALL_ENV) == '1', release)
 
 
 def evict_from_env(env) -> tuple[Path, int] | None:

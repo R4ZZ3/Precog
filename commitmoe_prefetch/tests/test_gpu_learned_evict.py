@@ -16,6 +16,7 @@ experiments/exp526_export_evict.py (EXP526_EVICT_BUNDLE).
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +32,7 @@ BUNDLE = Path(os.environ.get('EXP526_EVICT_BUNDLE', '/nonexistent'))
 STEPS = 5
 
 
-def _hooks(start_layer: int, timing: Path | None = None, record: Path | None = None):
+def _hooks(start_layer: int, timing: Path | None = None, record: Path | None = None, timing_all: bool = False):
     from commitmoe_prefetch import bank_loader
     from commitmoe_prefetch import freetoken as ft
     from test_gpu_schedule import PUBLISHED
@@ -39,8 +40,9 @@ def _hooks(start_layer: int, timing: Path | None = None, record: Path | None = N
     if not BUNDLE.is_file():
         pytest.skip('eviction bundle absent')
     cfg, state = bank_loader.load(PUBLISHED)
+    release = json.loads((PUBLISHED / 'manifest.json').read_text())['files']['model.safetensors']
     hooks = ft.PrefetchHooks(cfg, state, demand_stripes=16, evict=(BUNDLE, start_layer),
-                         timing=timing)
+                             timing=timing, timing_all=timing_all, release_sha256=release)
     hooks.reserve(SimpleNamespace(device=torch.device('cuda')))
     cache, hosts = _cache()
     if record is not None:
@@ -79,6 +81,7 @@ def test_live_rule_in_graph(start_layer):
         shadow_rule = LearnedEvict(keep=rule.keep.clone(), valid=rule.valid.clone(),
                                    target_of_layer=rule.target_of_layer, start_layer=start_layer,
                                    counters=torch.zeros_like(rule.counters))
+        previous = None
         for step in range(STEPS):
             inputs.draw(generator)
             prior_before = hooks.raw['prior_before'].clone()
@@ -86,6 +89,14 @@ def test_live_rule_in_graph(start_layer):
             graph.replay()
             torch.cuda.synchronize()
             assert int(rule.valid) == int(step > 0)
+            if previous is not None:
+                # The trunk read token t's inputs (saved before this replay), not token t+1's.
+                hidden, ids = previous
+                lo = hooks.first
+                assert torch.equal(hooks.raw['h'], hidden[lo:, 0].half())
+                assert torch.equal(hooks.raw['curr'], ids[lo:, 0].long())
+                assert torch.equal(hooks.raw['win'][:, 0], ids[lo - 1:-1, 0].long())
+                assert int(hooks.raw['tid']) == 100 + step - 1 and int(hooks.raw['upcoming_tid']) == 200 + step - 1
             g = hooks.bank.trunk({**hooks.raw, 'prior_before': prior_before})
             expect = torch.empty_like(rule.keep)
             hooks.evict(g, expect)
@@ -101,6 +112,7 @@ def test_live_rule_in_graph(start_layer):
             assert _check_resident_rows(cache, hosts) > 0
             hooks.after_decode(step, torch.tensor([100 + step], device='cuda'),
                                torch.tensor([200 + step], device='cuda'))
+            previous = (inputs.hidden.clone(), inputs.ids.clone())
         assert torch.equal(rule.counters, shadow_rule.counters)
         events, reranked, rescued = rule.counters.tolist()
         # Events at or above J with a miss, on the scored tokens (all but the first).
@@ -112,7 +124,7 @@ def test_live_rule_in_graph(start_layer):
 def test_timing_stamps(tmp_path):
     """The J diagnostic: per token, main's stamps rise layer by layer and the ready stamp exists."""
     out = tmp_path / 'stamps.pt'
-    hooks, cache, _ = _hooks(L - 1, timing=out)
+    hooks, cache, _ = _hooks(L - 1, timing=out, timing_all=True)
     inputs = _Inputs()
     graph = _capture(hooks, cache, inputs)
     generator = torch.Generator().manual_seed(3)
@@ -128,10 +140,13 @@ def test_timing_stamps(tmp_path):
     hooks.begin_request(3)
     rows = torch.load(out)
     stamps = rows['stamps']
-    assert stamps.shape == (6, L + 1) and rows['step'].tolist() == [0, 1, 2, 0, 1, 2]
+    assert stamps.shape == (6, L + 3) and rows['step'].tolist() == [0, 1, 2, 0, 1, 2]
     assert rows['start_layer'] == L - 1
     assert bool((stamps[:, 1:L] >= stamps[:, :L - 1]).all())  # main reaches the layers in order
     assert bool((stamps[:, L] >= stamps[:, 0]).all())  # scores are ready after the fork at layer 0
+    assert bool((stamps[:, L + 1] >= stamps[:, L - 1]).all())  # main at J (= 39), before the wait
+    assert bool((stamps[:, L + 2] >= stamps[:, L + 1]).all())  # after the wait
+    assert bool((stamps[:, L + 2] >= stamps[:, L]).all())  # the wait ended after the ready stamp
 
 
 def test_recorder_keeps_published_scores(tmp_path):
@@ -158,6 +173,36 @@ def test_recorder_keeps_published_scores(tmp_path):
     assert rec['evict_layers'] == hooks.evict.layers and rec['evict_start_layer'] == 8
 
 
+def test_nonfinite_scores_fall_back_to_lru():
+    """A NaN keep score must never reach the victim kernel: the token publishes valid = 0."""
+    hooks, cache, _ = _hooks(0)
+    hooks.evict.bias[0, 3] = float('nan')
+    inputs = _Inputs()
+    graph = _capture(hooks, cache, inputs)
+    generator = torch.Generator().manual_seed(5)
+    hooks.begin_request(1)
+    for step in range(3):
+        inputs.draw(generator)
+        hooks.before_decode(step)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert int(hooks.learned.valid) == 0
+        hooks.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
+    summary = hooks.summary()
+    assert summary['evict_nonfinite_tokens'] == 2  # steps 1 and 2; step 0 is never scored
+    assert summary['evict_events_scored'] == 0
+
+
+def test_bundle_from_other_release_is_refused():
+    from commitmoe_prefetch.evict import EvictRows
+    if not BUNDLE.is_file():
+        pytest.skip('eviction bundle absent')
+    cfg = _cfg()
+    with pytest.raises(ValueError, match='served release'):
+        EvictRows(BUNDLE, list(cfg.target_layers), cfg.architecture.up_dim, E, cfg.serving_reference.int8_group,
+                  torch.device('cuda'), release_sha256='0' * 64)
+
+
 def test_flag_from_env():
     from commitmoe_prefetch.freetoken import EVICT_ENV, EVICT_START_ENV, evict_from_env
     assert evict_from_env({}) is None
@@ -174,7 +219,7 @@ def test_shapes_are_the_bank_shapes():
     from commitmoe_prefetch.evict import EvictRows
     cfg = _cfg()
     rows = EvictRows(BUNDLE, list(cfg.target_layers), cfg.architecture.up_dim, E,
-                     cfg.serving_reference.int8_group, torch.device('cuda'))
+                     cfg.serving_reference.int8_group, torch.device('cuda'), release_sha256=None)
     assert rows.codes.shape == (len(rows.layers), E, cfg.architecture.up_dim)
     assert all(cfg.target_layers[0] <= x < L for x in rows.layers)
     assert K == cfg.base_model.top_k

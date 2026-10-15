@@ -8,8 +8,9 @@ flashlib's ``lru_ensure``. Three references:
 * ``ReplayRef``: a line-by-line NumPy port of native_multi.cpp's event loop, plus the live
   ``start_layer`` gate (the replay's ``score_start_layer``; layers below it use LRU). It is
   compared event by event: maps, usage, clock, plan and the rescued-slot count.
-* the compiled native_multi.cpp itself (when its source is present): final owners, ages,
-  clock, per-event hits and miss counts over a whole sequence.
+* the compiled replay (native_multi_timed.cpp, which is native_multi.cpp plus the start-layer
+  gate; when its source is present): per-event miss counts and hit flags, final owners, ages and
+  clock over a whole sequence, also at the release shapes and from a captured CUDA graph.
 * flashlib ``lru_ensure`` for the identity cases.
 
 Fixtures are small (tens of slots) so that every branch is hit often: full and partial target
@@ -35,7 +36,7 @@ REPLAY_SRC = Path(os.environ.get(
     "EXP522_REPLAY_DIR",
     "/mnt/e/CommoditizeTeraModel/commitmoe_modeling_bundle/commitmoe_export/.worktrees/codex-exp520/"
     "commitmoe_modeling_bundle/commitmoe_export/experiments/exp522_replay",
-)) / "native_multi.cpp"
+)) / "native_multi_timed.cpp"  # native_multi.cpp plus the start-layer gate; J=0 is the original rule
 
 
 class ReplayRef:
@@ -244,17 +245,15 @@ def test_duplicate_query_ids_match_lru():
 def native(tmp_path_factory):
     if not REPLAY_SRC.is_file():
         pytest.skip(f"replay source not found: {REPLAY_SRC}")
-    lib = tmp_path_factory.mktemp("native") / "native_multi.so"
+    lib = tmp_path_factory.mktemp("native") / "native_multi_timed.so"
     subprocess.run(["g++", "-O2", "-std=c++17", "-shared", "-fPIC", str(REPLAY_SRC), "-o", str(lib)], check=True)
     return ctypes.CDLL(str(lib))
 
 
-@pytest.mark.parametrize("case", [c for c in CASES if c[5] == 0])  # the compiled replay has no start layer
-@pytest.mark.parametrize("seed", [0, 1])
-def test_matches_compiled_replay(native, case, seed):
-    S, L, E, K, targets, _, _, _, _ = case
-    T = 40
-    routes, keep, available, cache, _, _ = run_live(case, seed, T)
+def native_replay(native, routes, keep, available, targets, S, start_layer):
+    """Whole-sequence replay_multi_timed from an empty cache: (owners, ages, clock, counts, hits)."""
+    T, L, K = routes.shape
+    E = keep.shape[2]
     M = len(targets)
     owners = np.full(S, -1, np.int32)
     ages = np.zeros(S, np.int64)
@@ -267,9 +266,105 @@ def test_matches_compiled_replay(native, case, seed):
     hits = np.zeros(ev * K, np.uint8)
     tv, ob, oa = (np.zeros(M * ev, np.int16) for _ in range(3))
     p = lambda a: a.ctypes.data_as(ctypes.c_void_p)  # noqa: E731
-    rc = native.replay_multi(p(np.ascontiguousarray(routes)), T, L, E, K, S, p(owners), p(ages), p(clock),
-                             p(scores), p(avail), p(tg), M, 1, 1, p(counts), p(hits), p(tv), p(ob), p(oa))
+    rc = native.replay_multi_timed(p(np.ascontiguousarray(routes)), T, L, E, K, S, p(owners), p(ages), p(clock),
+                                   p(scores), p(avail), p(tg), M, 1, 1, start_layer, p(counts), p(hits), p(tv),
+                                   p(ob), p(oa))
     assert rc == 0
+    return owners, ages, int(clock[0]), counts.reshape(T, L), hits.reshape(T, L, K).astype(bool)
+
+
+def drive(cache, rule, routes, keep, available, graph: bool = False):
+    """Run the kernel over every token, publishing row t-1 for token t as the hooks do.
+
+    Returns per-event miss counts and per-route hit flags (resident before the event) for the
+    comparison with the native replay. With graph=True one token's layer events are captured once
+    in a CUDA graph and replayed, as the decode graph does."""
+    T, L, K = routes.shape
+    dev = cache.id_of_slot.device
+    ids = torch.zeros(L, K, dtype=torch.int32, device=dev)
+    counts = torch.zeros(L, dtype=torch.int64, device=dev)
+    hits = torch.zeros(L, K, dtype=torch.bool, device=dev)
+
+    def token():
+        for layer in range(L):
+            hits[layer].copy_(cache.slot_for_id[layer].index_select(0, ids[layer].long()) >= 0)
+            learned_ensure(cache, layer, ids[layer], rule)
+            counts[layer].copy_(cache.num_indices[0])
+
+    g = None
+    out_counts, out_hits = np.zeros((T, L), np.int64), np.zeros((T, L, K), bool)
+    for t in range(T):
+        rule.keep.copy_(torch.from_numpy(keep[t - 1] if t > 0 else keep[0]))
+        rule.valid.fill_(int(t > 0 and bool(available[t - 1])))
+        ids.copy_(torch.from_numpy(routes[t]))
+        if graph and g is None:
+            # Capture needs one eager token first (Triton compiles on the first launch); that token
+            # runs on a scratch copy of the maps so that the real cache sees every token once.
+            scratch = {n: getattr(cache, n).clone() for n in ("slot_for_id", "id_of_slot", "usage", "step")}
+            counters = rule.counters.clone()
+            token()
+            for n, v in scratch.items():
+                getattr(cache, n).copy_(v)
+            rule.counters.copy_(counters)
+            ids.copy_(torch.from_numpy(routes[t]))
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                token()
+        if g is not None:
+            g.replay()
+        else:
+            token()
+        torch.cuda.synchronize()
+        out_counts[t], out_hits[t] = counts.cpu().numpy(), hits.cpu().numpy()
+    return out_counts, out_hits
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_matches_compiled_replay(native, case, seed):
+    S, L, E, K, targets, start, hot, ties, avail = case
+    T = 40
+    rng = np.random.default_rng(seed)
+    routes = make_routes(rng, T, L, E, K, hot)
+    keep = make_keep(rng, T, len(targets), E, ties)
+    available = rng.random(T) < avail
+    dev = torch.device("cuda")
+    cache, rule = make_cache(S, L, E, dev), make_rule(targets, L, E, start, dev)
+    counts, hits = drive(cache, rule, routes, keep, available)
+    owners, ages, clock, n_counts, n_hits = native_replay(native, routes, keep, available, targets, S, start)
+    assert np.array_equal(counts, n_counts)
+    assert np.array_equal(hits, n_hits)
     assert cache.id_of_slot.cpu().numpy().tolist() == owners.tolist()
     assert cache.usage.cpu().numpy().tolist() == ages.tolist()
-    assert int(cache.step) == int(clock[0])
+    assert int(cache.step) == clock
+
+
+# Release shapes: 40 layers x 256 experts, top 8, the nine EXP525 joint target layers, and the two
+# slot counts of the replays (3237: no-predictor auto size; 2615: the reference attach). BLOCK_C is
+# 4096 and the launch uses eight warps, as in serving.
+RELEASE_TARGETS = [18, 20, 22, 25, 27, 28, 30, 35, 36]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("S", [2615, 3237])
+@pytest.mark.parametrize("start", [0, 8])
+@pytest.mark.parametrize("graph", [False, True])
+def test_release_shapes_match_compiled_replay(native, S, start, graph):
+    L, E, K, T = 40, 256, 8, 24
+    rng = np.random.default_rng(S + start)
+    # A hot set of 64 experts per layer fills 3237 slots within about 12 tokens; the 30% cold
+    # events then keep every layer's batch share, so the target re-rank and the swap run often.
+    routes = make_routes(rng, T, L, E, K, 64)
+    keep = make_keep(rng, T, len(RELEASE_TARGETS), E, ties=True)
+    available = rng.random(T) < 0.9
+    dev = torch.device("cuda")
+    cache, rule = make_cache(S, L, E, dev), make_rule(RELEASE_TARGETS, L, E, start, dev)
+    counts, hits = drive(cache, rule, routes, keep, available, graph=graph)
+    owners, ages, clock, n_counts, n_hits = native_replay(native, routes, keep, available, RELEASE_TARGETS, S, start)
+    assert np.array_equal(counts, n_counts)
+    assert np.array_equal(hits, n_hits)
+    assert cache.id_of_slot.cpu().numpy().tolist() == owners.tolist()
+    assert cache.usage.cpu().numpy().tolist() == ages.tolist()
+    assert int(cache.step) == clock
+    events, reranked, rescued = rule.counters.tolist()
+    assert reranked > 0 and rescued > 0, rule.counters  # the swap path ran at release shape

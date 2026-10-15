@@ -17,13 +17,16 @@ from . import bank_loader
 from .qbank import qlinear
 
 BUNDLE_VERSION = 1
+HORIZON_TOKENS = 8  # the replay's keep score: next use within 8 tokens (column 0 of the B output)
 
 
 class EvictRows:
     """Keep-score rows of M target layers on ``device``; ``__call__`` writes (M, E) FP32 in place."""
 
     def __init__(self, path: Path, target_layers: list[int], up_dim: int, num_experts: int, group: int,
-                 device: torch.device):
+                 device: torch.device, release_sha256: str | None):
+        """``release_sha256``: the served bank's model.safetensors hash (from its manifest). The rows
+        read that bank's trunk, so a bundle exported against another release is refused."""
         bundle = torch.load(path, map_location='cpu', weights_only=True)
         if bundle.get('version') != BUNDLE_VERSION:
             raise ValueError(f'learned eviction bundle {path}: version {bundle.get("version")}, '
@@ -31,6 +34,11 @@ class EvictRows:
         layers = [int(L) for L in bundle['layers']]
         w, b = bundle['weight'], bundle['bias']
         problems = []
+        if bundle.get('horizon_tokens') != HORIZON_TOKENS:
+            problems.append(f'horizon {bundle.get("horizon_tokens")} tokens, expected {HORIZON_TOKENS}')
+        if release_sha256 is not None and bundle.get('release_sha256') != release_sha256:
+            problems.append(f'exported against release {str(bundle.get("release_sha256"))[:12]}, '
+                            f'served release is {release_sha256[:12]}')
         if layers != sorted(set(layers)) or not layers:
             problems.append(f'layers {layers} must be non-empty, ascending and unique')
         if missing := [L for L in layers if L not in target_layers]:
@@ -40,6 +48,8 @@ class EvictRows:
                             f'{(len(layers), num_experts, up_dim)}')
         if b.dtype != torch.bfloat16 or tuple(b.shape) != (len(layers), num_experts):
             problems.append(f'bias {b.dtype} {tuple(b.shape)}, expected bfloat16 {(len(layers), num_experts)}')
+        elif not bool(torch.isfinite(b.float()).all()):
+            problems.append('non-finite bias')
         if problems:
             raise ValueError(f'learned eviction bundle {path}: ' + '; '.join(problems))
         self.layers = layers

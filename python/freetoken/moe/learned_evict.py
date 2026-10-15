@@ -24,6 +24,13 @@ once per token and sets ``valid``; ``gate`` is 0 for the layers that run before 
 guaranteed to exist, and those events use plain LRU (the replay's missing-score fallback).
 With no target owning a batch slot, or with ``valid == 0``, the result equals ``lru_ensure`` slot
 for slot (tested).
+
+Contracts the caller keeps (the kernel does not check them on the device):
+- ``keep`` is finite whenever ``valid == 1``. A NaN never compares equal to the row minimum, so
+  the selection would read the sentinel key and return a slot outside the cache. The decode
+  hooks publish ``valid = 0`` for a token whose scores are not all finite.
+- The usage clock stays below 2**(63 - SLOT_BITS): (usage, slot) is packed into one int64 key
+  (2**51 at 4096 lanes, about 10**13 decode tokens at 40 layer events per token).
 """
 from __future__ import annotations
 
