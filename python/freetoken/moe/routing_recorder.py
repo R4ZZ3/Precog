@@ -5,7 +5,8 @@ addition it records, per decode step and MoE layer, the raw top-k expert ids bef
 ``ensure_experts`` maps them to slots, and which of them were resident at that moment. At the
 first decode step of a request it saves the expert-cache state after prefill (slot map, slot
 reverse map, LRU usage stamps, the cache step clock). With a predictor it also saves the
-predictor's scores of every step. When the next request begins, it writes one file per finished
+predictor's scores of every step, and with learned eviction (EXP526) the keep scores and their
+valid flag of every step. When the next request begins, it writes one file per finished
 request together with the live per-layer miss counters, which a replay must reproduce exactly.
 
 The writes inside the decode graph use fixed buffers and a device row index, so they are
@@ -85,6 +86,10 @@ class RoutingRecorder(DecodeHooks):
         self.snap_step = torch.empty((), dtype=torch.int64, device=dev)
         probs = getattr(self.inner, "probs", None)
         self.scores = None if probs is None else torch.zeros((C,) + tuple(probs.shape), dtype=probs.dtype, device=dev)
+        learned = getattr(self.inner, "learned", None)
+        self.keep = None if learned is None else torch.zeros((C,) + tuple(learned.keep.shape), dtype=learned.keep.dtype,
+                                                             device=dev)
+        self.keep_valid = None if learned is None else torch.zeros((C,), dtype=torch.int32, device=dev)
         after = torch.cuda.memory_allocated(dev) if dev.type == "cuda" else 0
         logger.info("routing recorder: %.2f MiB of buffers allocated after cache sizing (%d slots), output %s",
                     (after - before) / 2**20, S, self.out_dir)
@@ -98,6 +103,9 @@ class RoutingRecorder(DecodeHooks):
             self.hits.zero_()
             if self.scores is not None:
                 self.scores.zero_()
+            if self.keep is not None:
+                self.keep.zero_()
+                self.keep_valid.zero_()
         self.row.fill_(self.capacity)
         self.inner.begin_request(uid)
 
@@ -118,6 +126,10 @@ class RoutingRecorder(DecodeHooks):
         # these are the scores this step's forward used (computed at its layer 0).
         if self.scores is not None and step < self.capacity:
             self.scores[step].copy_(self.inner.probs)
+        if self.keep is not None and step < self.capacity:
+            # Published at this step's layer 0 and read by its layers >= start_layer.
+            self.keep[step].copy_(self.inner.learned.keep)
+            self.keep_valid[step].copy_(self.inner.learned.valid[0])
         self.inner.after_decode(step, consumed, sampled)
         self.steps = step + 1
         # Only observes between before_decode and after_decode write a real row; any other
@@ -170,6 +182,11 @@ class RoutingRecorder(DecodeHooks):
         }
         if self.scores is not None:
             record["scores"] = self.scores[:n].cpu()
+        if self.keep is not None:
+            learned = self.inner.learned
+            record.update(keep=self.keep[:n].cpu(), keep_valid=self.keep_valid[:n].cpu(),
+                          evict_layers=list(self.inner.evict.layers), evict_start_layer=learned.start_layer,
+                          evict_counters=learned.counters.cpu())
         path = self.out_dir / f"request_{self.sequence:03d}_uid{self.uid}.pt"
         torch.save(record, path)
         self.sequence += 1

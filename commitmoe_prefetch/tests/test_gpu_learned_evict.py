@@ -31,7 +31,7 @@ BUNDLE = Path(os.environ.get('EXP526_EVICT_BUNDLE', '/nonexistent'))
 STEPS = 5
 
 
-def _hooks(start_layer: int, timing: Path | None = None):
+def _hooks(start_layer: int, timing: Path | None = None, record: Path | None = None):
     from commitmoe_prefetch import bank_loader
     from commitmoe_prefetch import freetoken as ft
     from test_gpu_schedule import PUBLISHED
@@ -43,6 +43,12 @@ def _hooks(start_layer: int, timing: Path | None = None):
                          timing=timing)
     hooks.reserve(SimpleNamespace(device=torch.device('cuda')))
     cache, hosts = _cache()
+    if record is not None:
+        from freetoken.moe.routing_recorder import RoutingRecorder
+        recorder = RoutingRecorder(hooks, record, top_k=K)
+        recorder.bind(None, cache)
+        assert cache.learned_evict is hooks.learned
+        return recorder, cache, hosts
     hooks.bind(None, cache)
     assert cache.learned_evict is hooks.learned
     return hooks, cache, hosts
@@ -126,6 +132,30 @@ def test_timing_stamps(tmp_path):
     assert rows['start_layer'] == L - 1
     assert bool((stamps[:, 1:L] >= stamps[:, :L - 1]).all())  # main reaches the layers in order
     assert bool((stamps[:, L] >= stamps[:, 0]).all())  # scores are ready after the fork at layer 0
+
+
+def test_recorder_keeps_published_scores(tmp_path):
+    """The fidelity replay reads keep[r] and keep_valid[r]: the scores decode step r used."""
+    recorder, cache, _ = _hooks(8, record=tmp_path)
+    hooks = recorder.inner
+    inputs = _Inputs()
+    graph = _capture(recorder, cache, inputs)
+    generator = torch.Generator().manual_seed(4)
+    used = []
+    for uid in (1, 2):
+        recorder.begin_request(uid)
+        for step in range(3):
+            inputs.draw(generator)
+            recorder.before_decode(step)
+            graph.replay()
+            torch.cuda.synchronize()
+            if uid == 1:
+                used.append((hooks.learned.keep.clone(), int(hooks.learned.valid)))
+            recorder.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
+    rec = torch.load(next(tmp_path.glob('request_000_*.pt')))
+    assert rec['keep_valid'].tolist() == [v for _, v in used] == [0, 1, 1]
+    assert all(torch.equal(rec['keep'][r].cuda(), k) for r, (k, _) in enumerate(used))
+    assert rec['evict_layers'] == hooks.evict.layers and rec['evict_start_layer'] == 8
 
 
 def test_flag_from_env():
