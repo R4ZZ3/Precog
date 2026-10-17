@@ -6,7 +6,8 @@ addition it records, per decode step and MoE layer, the raw top-k expert ids bef
 first decode step of a request it saves the expert-cache state after prefill (slot map, slot
 reverse map, LRU usage stamps, the cache step clock). With a predictor it also saves the
 predictor's scores of every step, and with learned eviction (EXP526) the keep scores and their
-valid flag of every step. When the next request begins, it writes one file per finished
+valid flag of every step. With the prefetch hooks it also saves, after every step, the selected
+experts of each section, the pump's per-slot payload and the cumulative pump and demand counters. When the next request begins, it writes one file per finished
 request together with the live per-layer miss counters, which a replay must reproduce exactly.
 
 The writes inside the decode graph use fixed buffers and a device row index, so they are
@@ -90,7 +91,16 @@ class RoutingRecorder(DecodeHooks):
         self.keep = None if learned is None else torch.zeros((C,) + tuple(learned.keep.shape), dtype=learned.keep.dtype,
                                                              device=dev)
         self.keep_valid = None if learned is None else torch.zeros((C,), dtype=torch.int32, device=dev)
-        after = torch.cuda.memory_allocated(dev) if dev.type == "cuda" else 0
+        # Prefetch state after each step (EXP526 step 3): the selected gids of every section, the
+        # pump's per-slot payload counters, and the cumulative pump stats and demand counters. With
+        # these a replay compares its selections and stage/host misses step by step, not only per
+        # request. Copied in after_decode, outside the graph, as the scores.
+        self.prefetch = {}
+        if getattr(self.inner, "records", None) is not None:
+            for name, src in (("selections", self.inner.records), ("payload", self.inner.payload),
+                              ("pump_stats", self.inner.stats), ("demand_counters", self.inner.demand.counters)):
+                self.prefetch[name] = (src, torch.zeros((C,) + tuple(src.shape), dtype=src.dtype, device=dev))
+        after =torch.cuda.memory_allocated(dev) if dev.type == "cuda" else 0
         logger.info("routing recorder: %.2f MiB of buffers allocated after cache sizing (%d slots), output %s",
                     (after - before) / 2**20, S, self.out_dir)
 
@@ -106,6 +116,8 @@ class RoutingRecorder(DecodeHooks):
             if self.keep is not None:
                 self.keep.zero_()
                 self.keep_valid.zero_()
+            for _, rows in self.prefetch.values():
+                rows.zero_()
         self.row.fill_(self.capacity)
         self.inner.begin_request(uid)
 
@@ -130,6 +142,12 @@ class RoutingRecorder(DecodeHooks):
             # Published at this step's layer 0 and read by its layers >= start_layer.
             self.keep[step].copy_(self.inner.learned.keep)
             self.keep_valid[step].copy_(self.inner.learned.valid[0])
+        if step < self.capacity:
+            # The graph ended with main waiting for the probe and demand streams, so these hold
+            # this step's final selections and counts. The counters are cumulative over the
+            # request: a replay takes differences of consecutive rows.
+            for src, rows in self.prefetch.values():
+                rows[step].copy_(src)
         self.inner.after_decode(step, consumed, sampled)
         self.steps = step + 1
         # Only observes between before_decode and after_decode write a real row; any other
@@ -187,7 +205,11 @@ class RoutingRecorder(DecodeHooks):
             record.update(keep=self.keep[:n].cpu(), keep_valid=self.keep_valid[:n].cpu(),
                           evict_layers=list(self.inner.evict.layers), evict_start_layer=learned.start_layer,
                           evict_counters=learned.counters.cpu())
-        path = self.out_dir / f"request_{self.sequence:03d}_uid{self.uid}.pt"
+        if self.prefetch:
+            # pump_stats columns: commitmoe_prefetch.kernels.STATS_FIELDS; demand_counters columns:
+            # stage misses, host misses, host misses while pending (as live_counters).
+            record.update({name: rows[:n].cpu() for name, (_, rows) in self.prefetch.items()})
+        path =self.out_dir / f"request_{self.sequence:03d}_uid{self.uid}.pt"
         torch.save(record, path)
         self.sequence += 1
 

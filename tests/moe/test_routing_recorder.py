@@ -141,6 +141,48 @@ def test_overflow_steps_go_to_scratch_and_are_flagged(tmp_path):
     assert record["scores"][:, 0, 0].tolist() == [1.0, 2.0]
 
 
+def test_prefetch_state_saved_per_step_and_reset_per_request(tmp_path):
+    inner, cache = FakeInner(with_probs=True), make_cache()
+    # the prefetch hooks' buffers: selections (sections, slots), payload, pump stats, demand counters
+    inner.records = torch.full((2, 3), -1, dtype=torch.int64)
+    inner.payload = torch.zeros((2, 3), dtype=torch.int32)
+    inner.stats = torch.zeros(4, dtype=torch.int64)
+    rec = RoutingRecorder(inner, tmp_path, top_k=K, capacity=2)
+    rec.bind(None, cache)
+    rec.begin_request(1)
+    for step in range(3):  # step 2 overflows the capacity: never exported
+        rec.before_decode(step)
+        inner.records[0, 0] = 100 + step
+        inner.payload[1, 2] = step
+        inner.stats[3] += 1
+        inner.demand.counters[2, 0] += step
+        for layer in range(L):
+            rec.observe(layer, torch.zeros(1, 4), None, ids(0, 1))
+        rec.after_decode(step, torch.zeros(1), torch.zeros(1))
+    rec.begin_request(2)
+    inner.records.fill_(-1)  # the real hooks reset their buffers in begin_request
+    decode_step(rec, 0, [(0, 1)] * L)
+    rec.begin_request(3)
+    first, second = (torch.load(p) for p in files(tmp_path))
+    assert first["selections"][:, 0, 0].tolist() == [100, 101] and first["selections"].shape == (2, 2, 3)
+    assert first["payload"][:, 1, 2].tolist() == [0, 1]
+    assert first["pump_stats"][:, 3].tolist() == [1, 2]  # cumulative, as the live stats
+    assert first["demand_counters"][:, 2, 0].tolist() == [0, 1] and first["demand_counters"].shape == (2, L, 3)
+    # the second request starts from zeroed rows, not from the first request's last values
+    assert second["selections"].tolist() == [[[-1, -1, -1], [-1, -1, -1]]]
+    assert second["pump_stats"].tolist() == [[0, 0, 0, 3]]  # FakeInner does not reset its stats
+
+
+def test_no_prefetch_fields_without_prefetch_hooks(tmp_path):
+    rec = RoutingRecorder(FakeInner(with_probs=False), tmp_path, top_k=K)
+    rec.bind(None, make_cache())
+    rec.begin_request(1)
+    decode_step(rec, 0, [(0, 1)] * L)
+    rec.begin_request(2)
+    record = torch.load(files(tmp_path)[0])
+    assert not {"selections", "payload", "pump_stats", "demand_counters"} & record.keys()
+
+
 def test_rebind_before_recording_reallocates_and_after_recording_is_refused(tmp_path):
     inner = FakeInner(with_probs=False)
     rec = RoutingRecorder(inner, tmp_path, top_k=K)
