@@ -223,3 +223,30 @@ def test_profile_window_opens_and_closes_around_chosen_requests(monkeypatch):
         events.append(f"uid{uid}")
     assert events == ["uid10", "start", "uid11", "stop", "start", "uid12", "stop", "uid13"]
     assert window.copy_missing(None, 0) is True and inner.calls[-1] == ("copy_missing", 0)
+
+
+@pytest.mark.parametrize("record,profile", [(False, False), (True, False), (False, True), (True, True)])
+def test_engine_wraps_hooks_for_recording_and_profiling(tmp_path, monkeypatch, record, profile):
+    from freetoken.engine import engine
+    from freetoken.moe.routing_recorder import ProfileWindow
+
+    base = FakeInner(with_probs=False)
+    monkeypatch.setattr(engine, "_build_decode_hooks", lambda config: base)
+    monkeypatch.delenv("FREETOKEN_ROUTING_RECORD_DIR", raising=False)
+    monkeypatch.delenv("FREETOKEN_PROFILE_REQUESTS", raising=False)
+    if record:
+        monkeypatch.setenv("FREETOKEN_ROUTING_RECORD_DIR", str(tmp_path))
+    if profile:
+        monkeypatch.setenv("FREETOKEN_PROFILE_REQUESTS", "2,11")
+    config = SimpleNamespace(model_config=SimpleNamespace(num_experts_per_tok=K))
+    hooks = engine._load_decode_hooks(config)
+    # with both, the window is outermost and the recorder sits directly on the real hooks
+    chain = []
+    while hooks is not base:
+        chain.append(type(hooks))
+        hooks = hooks.inner
+    want = ([ProfileWindow] if profile else []) + ([RoutingRecorder] if record else [])
+    assert chain == want
+    if profile:
+        outer = engine._load_decode_hooks(config)
+        assert outer.requests == frozenset({2, 11})

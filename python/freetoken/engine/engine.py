@@ -1392,7 +1392,10 @@ def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
     FREETOKEN_ROUTING_RECORD_DIR wraps them in the routing recorder. FREETOKEN_PROFILE_REQUESTS
     (comma-separated request indexes) wraps them in a profiler window for nsys. Both need hooks
     to wrap, so they refuse to run when neither --expert-predictor nor
-    --moe-demand-copy-stripes is set.
+    --moe-demand-copy-stripes is set. With both, the profiler window wraps the recorder: one serve
+    then gives the routes, selections and counters of exactly the decode steps it profiles (the
+    pump's stage/host outcome depends on timing, so two serves would not match step by step). The
+    recorder's own kernels are then in the profile; they are named, so an analysis can label them.
     """
     hooks = _build_decode_hooks(config)
     out_dir = os.environ.get("FREETOKEN_ROUTING_RECORD_DIR")
@@ -1402,13 +1405,13 @@ def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
     if hooks is None:
         raise ValueError("FREETOKEN_ROUTING_RECORD_DIR and FREETOKEN_PROFILE_REQUESTS need "
                          "--expert-predictor or --moe-demand-copy-stripes")
-    if out_dir and profile:
-        raise ValueError("record the routing and profile in separate runs: the recorder adds device work")
     from freetoken.moe.routing_recorder import ProfileWindow, RoutingRecorder
 
+    if out_dir:
+        hooks = RoutingRecorder(hooks, out_dir, top_k=config.model_config.num_experts_per_tok)
     if profile:
-        return ProfileWindow(hooks, frozenset(int(x) for x in profile.split(",")))
-    return RoutingRecorder(hooks, out_dir, top_k=config.model_config.num_experts_per_tok)
+        hooks = ProfileWindow(hooks, frozenset(int(x) for x in profile.split(",")))
+    return hooks
 
 
 def _build_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
