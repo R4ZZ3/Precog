@@ -148,3 +148,65 @@ def test_split_under_graph_replay_at_release_shapes():
         assert one.abs().sum() > 0
         assert torch.equal(one, two)
         assert torch.equal(two, fused_experts_decode_fp8_blockscale(x, *banks, w, ids))
+
+
+def test_missed_routes_wait_for_the_join_under_graph_replay():
+    """EXP538: the NaN race test inside two CUDA graphs captured from the same stream, copy stream
+    and function objects, replayed alternately. Each replay poisons the missed rows first; the
+    captured copy stream sleeps, then writes the real rows. A missing join edge in either graph
+    lets NaN reach the output."""
+    from freetoken.kernel.triton.fp8_blockscale_moe import (
+        fused_experts_decode_fp8_blockscale,
+        fused_experts_decode_fp8_blockscale_split,
+    )
+
+    real = _banks(4)
+    work = [b.clone() for b in real]
+    missed_count = 3
+    x = torch.zeros((1, H), dtype=torch.bfloat16, device="cuda")
+    w = torch.zeros((1, TOPK), device="cuda")
+    ids = torch.zeros((1, TOPK), dtype=torch.int32, device="cuda")
+    resident = torch.ones(TOPK, dtype=torch.int32, device="cuda")
+    missed = torch.zeros(missed_count, dtype=torch.int64, device="cuda")
+    copy_stream = torch.cuda.Stream()
+
+    def forward():
+        main = torch.cuda.current_stream()
+        copy_stream.wait_stream(main)
+        with torch.cuda.stream(copy_stream):
+            torch.cuda._sleep(20_000_000)  # long enough that pass 1 finishes before the copy lands
+            for b, r in zip(work, real):  # index_copy_ has no FP8 CUDA kernel; index_put_ has
+                b[missed] = r[missed]
+        return fused_experts_decode_fp8_blockscale_split(x, *work, w, ids, resident,
+                                                         lambda: main.wait_stream(copy_stream))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs, outs = [], []
+    with torch.cuda.stream(stream):
+        forward()  # eager warm-up, as the graph runner does
+        for _ in range(2):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outs.append(forward())
+            graphs.append(graph)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    generator = torch.Generator().manual_seed(538)
+    for replay in range(8):
+        w_new, ids_new = _routing(1, generator)
+        positions = torch.randperm(TOPK, generator=generator)[:missed_count].cuda()
+        x.copy_(torch.randn((1, H), generator=generator))
+        w.copy_(w_new)
+        ids.copy_(ids_new)
+        resident.fill_(1)
+        resident[positions] = 0
+        missed.copy_(ids_new.flatten()[positions].long())
+        for b in work:  # the missed experts' rows hold NaN until the captured copy lands
+            b[missed] = torch.tensor(float("nan"), dtype=torch.float32).to(b.dtype)
+        torch.cuda.synchronize()
+        graphs[replay % 2].replay()
+        torch.cuda.synchronize()
+        expected = fused_experts_decode_fp8_blockscale(x, *real, w, ids)
+        assert torch.isfinite(outs[replay % 2]).all(), replay
+        assert torch.equal(outs[replay % 2], expected), replay

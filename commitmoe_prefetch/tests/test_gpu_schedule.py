@@ -206,3 +206,85 @@ def test_scores_use_end_of_token_features(monkeypatch):
             hooks.after_decode(step, torch.tensor([100 + step], device='cuda'),
                                torch.tensor([200 + step], device='cuda'))
             previous = (inputs.hidden.clone(), inputs.ids.clone())
+
+
+
+def _one_token(hooks, graph, inputs, generator, step):
+    """One replayed token with scores that favour exactly the experts it routes."""
+    inputs.draw(generator)
+    hooks.bank.out.zero_()
+    routes = inputs.ids[hooks.first:, 0].long()
+    hooks.bank.out.scatter_(1, routes, torch.linspace(0.9, 0.5, K, device='cuda').expand(len(routes), K))
+    hooks.before_decode(step)
+    graph.replay()
+    hooks.after_decode(step, torch.tensor([7], device='cuda'), torch.tensor([9], device='cuda'))
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize('split', [False, True])
+def test_unfinished_stages_fall_back_to_the_host(monkeypatch, split):
+    """Deterministic incomplete stages: the experts are selected every section, but the pump never
+    launches (a quota of 0 does not compile), so no stage lands or is published and every miss of a
+    selected expert must read the host, byte-exact. (A stage becomes visible to demand only when
+    complete; the matched-but-unready branch of the demand kernel is tested in
+    tests/moe/test_striped_demand.py.)"""
+    from commitmoe_prefetch import kernels
+
+    class _NoPump:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(kernels, 'publishing_pump', _NoPump())
+    hooks, cache, hosts = _hooks(monkeypatch, _ChosenBank)
+    inputs = _Inputs()
+    graph = _capture(hooks, cache, inputs, SLEEP_CYCLES, split)
+    hooks.begin_request(1)
+    generator = torch.Generator().manual_seed(5)
+    for step in range(STEPS):
+        _one_token(hooks, graph, inputs, generator, step)
+        assert _check_resident_rows(cache, hosts) > 0
+    summary = hooks.summary()
+    assert summary['published'] == 0 and summary['misses_from_stage'] == 0, summary
+    assert summary['misses_from_host'] > 0 and summary['copied_bytes'] == 0, summary
+
+
+def test_recapture_with_the_same_events(monkeypatch):
+    """EXP538: two graphs captured from the same hooks (the same per-layer Event objects), after a
+    request reset, replayed alternately. Every staged copy must still be consumed byte-exact and,
+    with the sleep, every selected expert must land in time, as in the one-graph test."""
+    hooks, cache, hosts = _hooks(monkeypatch, _ChosenBank)
+    inputs = _Inputs()
+    graphs = [_capture(hooks, cache, inputs, SLEEP_CYCLES, True) for _ in range(2)]
+    generator = torch.Generator().manual_seed(6)
+    for uid in (1, 2):
+        hooks.begin_request(uid)
+        assert not any(hooks.summary().values())
+        for step in range(STEPS):
+            _one_token(hooks, graphs[step % 2], inputs, generator, step)
+            assert _check_resident_rows(cache, hosts) > 0
+        summary = hooks.summary()
+        assert summary['published'] == 16 * (STEPS - 1), summary
+        assert summary['misses_from_stage'] == summary['published'], summary
+
+
+def test_split_keeps_the_cache_decisions(monkeypatch):
+    """The overlap schedule changes timing only: fed the same routes and scores, the split and the
+    one-pass schedules leave the same cache maps after every token."""
+    names = ('slot_for_id', 'id_of_slot', 'usage', 'step')
+    runs = []
+    for split in (False, True):
+        hooks, cache, hosts = _hooks(monkeypatch, _ChosenBank)
+        inputs = _Inputs()
+        graph = _capture(hooks, cache, inputs, SLEEP_CYCLES, split)
+        hooks.begin_request(1)
+        generator = torch.Generator().manual_seed(7)
+        maps = []
+        for step in range(STEPS):
+            _one_token(hooks, graph, inputs, generator, step)
+            assert _check_resident_rows(cache, hosts) > 0
+            maps.append({n: getattr(cache, n).clone() for n in names})
+        runs.append(maps)
+        del hooks, cache, hosts, graph
+    for step, (a, b) in enumerate(zip(*runs)):
+        for n in names:
+            assert torch.equal(a[n], b[n]), (step, n)

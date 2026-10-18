@@ -69,7 +69,7 @@ def _shadow(cache):
 
 
 @pytest.mark.parametrize('split', [False, True])
-@pytest.mark.parametrize('start_layer', [0, 8])
+@pytest.mark.parametrize('start_layer', [0, 1, 8])  # 1 is the deployed J of the 30 rows
 def test_live_rule_in_graph(start_layer, split):
     """``split``: the overlap schedule (EXP538) must give the same decisions and scores."""
     from freetoken.moe.learned_evict import LearnedEvict, learned_ensure
@@ -153,24 +153,29 @@ def test_timing_stamps(tmp_path):
     assert bool((stamps[:, L + 2] >= stamps[:, L]).all())  # the wait ended after the ready stamp
 
 
-def test_recorder_keeps_published_scores(tmp_path):
-    """The fidelity replay reads keep[r] and keep_valid[r]: the scores decode step r used."""
+@pytest.mark.parametrize('split', [False, True])
+def test_recorder_keeps_published_scores(tmp_path, split):
+    """The fidelity replay reads keep[r] and keep_valid[r]: the scores decode step r used.
+    ``split`` (EXP538) runs the overlap schedule through ProfileWindow(RoutingRecorder(hooks)),
+    the wrapper order of a profiled serve, with no request profiled."""
+    from freetoken.moe.routing_recorder import ProfileWindow
     recorder, cache, _ = _hooks(8, record=tmp_path)
     hooks = recorder.inner
+    outer = ProfileWindow(recorder, frozenset()) if split else recorder
     inputs = _Inputs()
-    graph = _capture(recorder, cache, inputs)
+    graph = _capture(outer, cache, inputs, split=split)
     generator = torch.Generator().manual_seed(4)
     used = []
     for uid in (1, 2):
-        recorder.begin_request(uid)
+        outer.begin_request(uid)
         for step in range(3):
             inputs.draw(generator)
-            recorder.before_decode(step)
+            outer.before_decode(step)
             graph.replay()
             torch.cuda.synchronize()
             if uid == 1:
                 used.append((hooks.learned.keep.clone(), int(hooks.learned.valid)))
-            recorder.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
+            outer.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
     rec = torch.load(next(tmp_path.glob('request_000_*.pt')))
     assert rec['keep_valid'].tolist() == [v for _, v in used] == [0, 1, 1]
     assert all(torch.equal(rec['keep'][r].cuda(), k) for r, (k, _) in enumerate(used))
