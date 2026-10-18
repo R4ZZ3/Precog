@@ -174,6 +174,9 @@ class RoutingRecorder(DecodeHooks):
     def copy_missing(self, cache, layer_id: int) -> bool:
         return self.inner.copy_missing(cache, layer_id)
 
+    def begin_copy(self, cache, layer_id: int):
+        return self.inner.begin_copy(cache, layer_id)
+
     # -- export --------------------------------------------------------------------
 
     def _export(self) -> None:
@@ -268,3 +271,6 @@ class ProfileWindow(DecodeHooks):
 
     def copy_missing(self, cache, layer_id: int) -> bool:
         return self.inner.copy_missing(cache, layer_id)
+
+    def begin_copy(self, cache, layer_id: int):
+        return self.inner.begin_copy(cache, layer_id)

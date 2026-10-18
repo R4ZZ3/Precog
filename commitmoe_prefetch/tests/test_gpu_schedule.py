@@ -11,6 +11,9 @@ Checked after every token:
 - with a real bank: the raw features are token t-1's, the probabilities equal the bank
   on those features, and the prior moved only from step 1 on;
 - request state starts from zero on the second request.
+
+``split=True`` runs the overlap schedule of FREETOKEN_OVERLAP_RESIDENT (EXP538) instead:
+begin_copy, half the sleep (the resident routes), finish(), the other half (the missing routes).
 """
 from __future__ import annotations
 
@@ -67,26 +70,34 @@ class _Inputs:
                        .int())
 
 
-def _decode(hooks, cache, inputs, sleep=SLEEP_CYCLES):
+def _decode(hooks, cache, inputs, sleep=SLEEP_CYCLES, split=False):
     for layer in range(L):
         inputs.work[layer].copy_(inputs.ids[layer])
         hooks.observe(layer, inputs.hidden[layer], inputs.logits[layer], inputs.work[layer])
         cache.ensure_experts(layer, inputs.work[layer])
-        assert hooks.copy_missing(cache, layer)
+        if not split:
+            assert hooks.copy_missing(cache, layer)
+            if sleep:
+                torch.cuda._sleep(sleep)
+            continue
+        finish = hooks.begin_copy(cache, layer)
         if sleep:
-            torch.cuda._sleep(sleep)
+            torch.cuda._sleep(sleep // 2)
+        finish()
+        if sleep:
+            torch.cuda._sleep(sleep // 2)
 
 
-def _capture(hooks, cache, inputs, sleep=SLEEP_CYCLES):
+def _capture(hooks, cache, inputs, sleep=SLEEP_CYCLES, split=False):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        _decode(hooks, cache, inputs, sleep)  # eager warmup, as the graph runner does
+        _decode(hooks, cache, inputs, sleep, split)  # eager warmup, as the graph runner does
     torch.cuda.current_stream().wait_stream(side)
     hooks.begin_request(-1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _decode(hooks, cache, inputs, sleep)
+        _decode(hooks, cache, inputs, sleep, split)
     return graph
 
 
@@ -127,14 +138,15 @@ def _hooks(monkeypatch, bank_class=None):
     return hooks, cache, hosts
 
 
+@pytest.mark.parametrize('split', [False, True])
 @pytest.mark.parametrize('sleep', [SLEEP_CYCLES, 0])
-def test_staged_copies_are_consumed_byte_exact(monkeypatch, sleep):
+def test_staged_copies_are_consumed_byte_exact(monkeypatch, sleep, split):
     """With the sleep every selected expert lands in time. Without it the layers run faster
     than the pump, so pumps yield to the demand copy, sections expire and some experts stay
     partial; demand must then read the host, and the rows must still be exact."""
     hooks, cache, hosts = _hooks(monkeypatch, _ChosenBank)
     inputs = _Inputs()
-    graph = _capture(hooks, cache, inputs, sleep)
+    graph = _capture(hooks, cache, inputs, sleep, split)
     generator = torch.Generator().manual_seed(0)
     for uid in (1, 2):
         hooks.begin_request(uid)

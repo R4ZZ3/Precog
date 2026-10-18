@@ -68,13 +68,15 @@ def _shadow(cache):
                            collect_stats=False, lru_stats=None, num_experts=cache.num_experts)
 
 
+@pytest.mark.parametrize('split', [False, True])
 @pytest.mark.parametrize('start_layer', [0, 8])
-def test_live_rule_in_graph(start_layer):
+def test_live_rule_in_graph(start_layer, split):
+    """``split``: the overlap schedule (EXP538) must give the same decisions and scores."""
     from freetoken.moe.learned_evict import LearnedEvict, learned_ensure
     hooks, cache, hosts = _hooks(start_layer)
     rule = hooks.learned
     inputs = _Inputs()
-    graph = _capture(hooks, cache, inputs)
+    graph = _capture(hooks, cache, inputs, split=split)
     generator = torch.Generator().manual_seed(2)
     for uid in (1, 2):
         hooks.begin_request(uid)
@@ -332,3 +334,35 @@ def test_live_features_equal_the_offline_source_through_resets_and_replays():
                 assert int(rule.valid) == 1
             hooks.after_decode(step, torch.tensor([100 + step], device='cuda'),
                                torch.tensor([200 + step], device='cuda'))
+
+
+@pytest.mark.parametrize('start_layer', [1, 8])
+def test_copy_never_writes_a_resident_route_slot(start_layer):
+    """EXP538 pass 1 reads the slots of the routes resident before ensure_experts while the demand
+    copy runs. Under the learned rule, no slot that the copy writes (evict_slots[:num_indices])
+    may be one of those slots, and every resident route keeps its slot. Eager, scored tokens."""
+    hooks, cache, hosts = _hooks(start_layer)
+    inputs = _Inputs()
+    generator = torch.Generator().manual_seed(3)
+    hooks.begin_request(1)
+    checked = 0
+    for step in range(STEPS):
+        inputs.draw(generator)
+        hooks.before_decode(step)
+        for layer in range(L):
+            work = inputs.work[layer]
+            work.copy_(inputs.ids[layer])
+            hooks.observe(layer, inputs.hidden[layer], inputs.logits[layer], work)
+            before = cache.slot_for_id[layer].index_select(0, work.reshape(-1)).clone()
+            cache.ensure_experts(layer, work)
+            torch.cuda.synchronize()
+            resident = before >= 0
+            written = cache.evict_slots[:int(cache.num_indices)].long()
+            assert torch.equal(work.reshape(-1)[resident], before[resident])  # ids rewritten to the same slots
+            assert not torch.isin(before[resident].long(), written).any(), (step, layer)
+            checked += int(resident.sum())
+            hooks.begin_copy(cache, layer)()
+        torch.cuda.synchronize()
+        assert _check_resident_rows(cache, hosts) > 0
+        hooks.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
+    assert checked > 0 and hooks.learned.counters[2] > 0  # resident routes seen and slots rescued

@@ -108,11 +108,16 @@ class StripedDemand:
 
     def copy(self, cache, layer: int) -> None:
         """Host-only demand copy of one layer on the copy stream, joined back into the main stream."""
+        self.copy_unjoined(cache, layer)()
+
+    def copy_unjoined(self, cache, layer: int):
+        """Enqueue the host-only demand copy and return the join: the caller may enqueue work that
+        does not read the missing experts before it calls the join (EXP538)."""
         main = torch.cuda.current_stream()
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
             self.launch(cache, layer)
-        main.wait_stream(self.stream)
+        return lambda: main.wait_stream(self.stream)
 
 
 class StripedDemandHooks(DecodeHooks):
@@ -138,3 +143,6 @@ class StripedDemandHooks(DecodeHooks):
     def copy_missing(self, cache, layer_id: int) -> bool:
         self.demand.copy(cache, layer_id)
         return True
+
+    def begin_copy(self, cache, layer_id: int):
+        return self.demand.copy_unjoined(cache, layer_id)

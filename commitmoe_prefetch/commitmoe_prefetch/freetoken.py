@@ -167,6 +167,8 @@ class PrefetchHooks(DecodeHooks):
         self.layer = torch.full((1,), -1, dtype=torch.int32, device=dev)
         self.storage = torch.empty(STAGE_BYTES, dtype=torch.uint8, device=dev)
         self.probe_stream = torch.cuda.Stream(device=dev, priority=-1)
+        # begin_copy (EXP538): per layer, the point of main that the probe section depends on
+        self.copy_events = [torch.cuda.Event() for _ in range(self.cfg.base_model.num_layers)]
         if self.evict_cfg is not None:
             path, start = self.evict_cfg
             self.evict = EvictRows(path, list(cfg.target_layers), cfg.architecture.up_dim, E,
@@ -356,6 +358,38 @@ class PrefetchHooks(DecodeHooks):
 
     def copy_missing(self, cache: OffloadMoeCache, layer_id: int) -> bool:
         main = torch.cuda.current_stream()
+        self._launch_demand(cache, layer_id)
+        main.wait_stream(self.demand.stream)
+        self._after_demand(cache, layer_id, lambda: self.probe_stream.wait_stream(main))
+        return True
+
+    def begin_copy(self, cache: OffloadMoeCache, layer_id: int):
+        """copy_missing without the join (DecodeHooks.begin_copy, EXP538).
+
+        In copy_missing the probe section waits for main after main joined the demand copy, so it
+        depends on main's work before the copy plus the copy itself. Here main runs the resident
+        routes between the launch and finish(), so the probe section waits for an event recorded
+        on main right after the launch and for the demand stream: the same two dependencies, and
+        none on the resident-route GEMMs. The last layer's probe join moves into finish(), so it
+        still precedes every GEMM that reads a missing expert, and the token's next step.
+        """
+        main = torch.cuda.current_stream()
+        self._launch_demand(cache, layer_id)
+        before = self.copy_events[layer_id]
+        before.record(main)
+
+        def wait_inputs() -> None:
+            self.probe_stream.wait_event(before)
+            self.probe_stream.wait_stream(self.demand.stream)
+
+        def finish() -> None:
+            main.wait_stream(self.demand.stream)
+            self._after_demand(cache, layer_id, wait_inputs)
+        return finish
+
+    def _launch_demand(self, cache: OffloadMoeCache, layer_id: int) -> None:
+        """The L0 score (without learned eviction) and the BUSY-bracketed demand copy of the layer."""
+        main = torch.cuda.current_stream()
         probe, demand = self.probe_stream, self.demand
         if layer_id == 0 and self.learned is None:  # with learned eviction, observe(0) scored
             probe.wait_stream(main)
@@ -366,11 +400,16 @@ class PrefetchHooks(DecodeHooks):
             kernels.phase[(1,)](self.busy, self.layer, cache.num_indices, L=layer_id)
             demand.launch(cache, layer_id, stages=self.stage_ptrs)
             kernels.phase[(1,)](self.busy, self.layer, cache.num_indices, L=layer_id, CLEAR=True)
-        main.wait_stream(demand.stream)
+
+    def _after_demand(self, cache: OffloadMoeCache, layer_id: int, wait_inputs) -> None:
+        """The probe section of the layer (stage retire and select, pump) after ``wait_inputs()``
+        made the probe stream depend on the demand copy, then the last layer's probe join."""
+        main = torch.cuda.current_stream()
+        probe, demand = self.probe_stream, self.demand
         sl = kernels.SECTION_LAYERS
         if layer_id < self.sections * sl:
             section = layer_id // sl
-            probe.wait_stream(main)
+            wait_inputs()
             with torch.cuda.stream(probe):
                 if layer_id % sl == 0:
                     kernels.retire[(1,)](demand.ids, demand.ready, SECTION=section, SLOTS=kernels.SLOTS)
@@ -391,7 +430,6 @@ class PrefetchHooks(DecodeHooks):
                     num_warps=8)
         if layer_id == self.cfg.base_model.num_layers - 1:
             main.wait_stream(probe)
-        return True
 
     # -- reporting -----------------------------------------------------------------
 

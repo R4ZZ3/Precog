@@ -51,6 +51,17 @@ class DecodeHooks:
         """
         return False
 
+    def begin_copy(self, cache: OffloadMoeCache, layer_id: int):
+        """Like ``copy_missing``, but return a ``finish`` callable instead of joining (EXP538).
+
+        The caller may enqueue work that reads no missing expert (the resident routes) on the
+        current stream, then must call ``finish()`` before any work that reads a missing expert.
+        ``finish`` joins the copy and enqueues the rest of the hook's per-layer schedule, with the
+        same dependencies as ``copy_missing``. Hooks without this split raise, so the overlap path
+        fails closed instead of running an unsupported schedule.
+        """
+        raise RuntimeError(f"{type(self).__name__} cannot split its copy (FREETOKEN_OVERLAP_RESIDENT)")
+
 
 def charge_reservation(engine, hooks: DecodeHooks) -> int:
     """Run ``hooks.reserve`` and add the device bytes it took to the engine's weight bytes.

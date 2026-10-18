@@ -36,6 +36,7 @@ def _decode_fp8_moe_kernel(
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # BLOCK_K == 128 (one weight scale block)
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr, EVEN_K: tl.constexpr,
+    route_mask_ptr=None, MASK_MODE: tl.constexpr = 0,  # 0 all routes, 1 routes with mask != 0, 2 with mask == 0
 ):
     route_id = tl.program_id(0)
     n_block = tl.program_id(1)
@@ -52,7 +53,14 @@ def _decode_fp8_moe_kernel(
     s_slot = s_ptr + slot * stride_se
 
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    for kb in range(tl.cdiv(K, BLOCK_K)):
+    k_blocks = tl.cdiv(K, BLOCK_K)
+    run = True
+    if MASK_MODE != 0:
+        selected = tl.load(route_mask_ptr + route_id) != 0
+        run = selected if MASK_MODE == 1 else ~selected
+        # a skipped route reads no weights and stores nothing; a run route computes exactly as without a mask
+        k_blocks = tl.where(run, k_blocks, 0)
+    for kb in range(k_blocks):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
         if EVEN_K:
             k_mask = tl.full((BLOCK_K,), True, tl.int1)
@@ -77,10 +85,10 @@ def _decode_fp8_moe_kernel(
     if MUL_ROUTED_WEIGHT:
         acc *= tl.load(topk_weights_ptr + token_id * stride_twm + route_k * stride_twk)
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
-    tl.store(c_ptrs, acc.to(compute_type), mask=(route_id < total_routes) & n_mask)
+    tl.store(c_ptrs, acc.to(compute_type), mask=(route_id < total_routes) & n_mask & run)
 
 
-def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is_route):
+def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is_route, route_mask=None, mask_mode=0):
     M, top_k = topk_ids.shape
     N = w.shape[1]
     total_routes = M * top_k
@@ -97,7 +105,8 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
         topk_weights.stride(0), topk_weights.stride(1), topk_ids.stride(0), topk_ids.stride(1),
         BLOCK_N=BLOCK_N, BLOCK_K=128, TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), EVEN_K=w.shape[2] % 128 == 0, num_warps=4,
+        compute_type=_TL.get(c.dtype, tl.bfloat16), EVEN_K=w.shape[2] % 128 == 0,
+        route_mask_ptr=route_mask, MASK_MODE=mask_mode, num_warps=4,
     )
 
 
@@ -122,6 +131,42 @@ def fused_experts_decode_fp8_blockscale(
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True)
+    out = torch.empty_like(hidden_states)
+    moe_sum_reduce_triton(ic3, out)
+    return out
+
+
+def fused_experts_decode_fp8_blockscale_split(
+    hidden_states, gate_up, gate_up_scale, down, down_scale,
+    topk_weights, topk_ids, resident, join, activation="silu", act_alpha=1.0, act_limit=float("inf"),
+) -> torch.Tensor:
+    """``fused_experts_decode_fp8_blockscale`` in two passes (EXP519 direction-1 prototype).
+
+    Pass 1 computes the routes whose expert was resident (``resident`` [M * top_k], nonzero),
+    then ``join()`` makes the stream wait for the demand copy, then pass 2 computes the other
+    routes. Every route is computed by the same program as in the one-pass function and the
+    final reduction is unchanged, so the output is bit-identical. The activation runs over all
+    rows in both passes: pass 1 also activates the not-yet-computed rows, which pass 2 recomputes.
+    Those rows are uninitialized in pass 1. The activation is row-local, so they cannot reach a
+    computed row; zeroing them would add a memset per layer, which the prototype does not pay.
+    """
+    from freetoken.kernel import moe_sum_reduce_triton
+    from freetoken.layers import gated_act_and_mul
+
+    M, H = hidden_states.shape
+    top_k = topk_ids.shape[1]
+    two_i = gate_up.shape[1]
+    inter = two_i // 2
+    dev, dt = hidden_states.device, hidden_states.dtype
+    ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
+    ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
+    ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
+    for mode in (1, 2):
+        if mode == 2:
+            join()
+        _decode_gemm(hidden_states, gate_up, gate_up_scale, ic1, topk_weights, topk_ids, False, False, resident, mode)
+        gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
+        _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True, resident, mode)
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out
