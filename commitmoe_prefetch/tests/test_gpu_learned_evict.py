@@ -458,3 +458,6 @@ def test_split_equals_one_pass_at_every_event():
     assert events > 0 and reranked > 0 and rescued > 0, last['counters']
     assert any(not bool(e['hit'].all()) for tok in one_pass for e in tok['events'])
     assert any(len(e['victims']) for tok in one_pass for e in tok['events'])
+    # Stage-served demand was exercised: the summary is per request, so read each request's last token.
+    ends = [one_pass[STEPS - 1]['summary'], one_pass[-1]['summary']]
+    assert sum(e['published'] for e in ends) > 0 and sum(e['misses_from_stage'] for e in ends) > 0, ends
