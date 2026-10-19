@@ -10,6 +10,8 @@ This test checks the wiring that those tests cannot see:
   the cache maps, fed the same routes and the same published scores, with layers below J on LRU.
   Together with the kernel tests this makes the live decisions equal to the replay rule;
 - every resident slot still holds its expert's bytes (staged and demand copies unaffected).
+- with a version 2 bundle (EXP540): every live raw input equals the offline definition that the
+  borrowed rows were trained on, and rows that share a source head read that head's trunk.
 
 Needs the published predictor (COMMITMOE_PREDICTOR_DIR) and an eviction bundle from
 experiments/exp526_export_evict.py (EXP526_EVICT_BUNDLE).
@@ -250,3 +252,81 @@ def test_v2_borrowed_rows_equal_the_rows_on_their_source_head(tmp_path):
         v1(g, one)
         assert torch.equal(keep[m], one[0]), (owner, source)
     assert torch.isfinite(keep).all() and not torch.equal(keep[0], keep[1])  # distinct rows, one source
+
+
+def _offline_raw(cfg, history, t):
+    """Raw inputs of token t of a request by the offline definition (experiments/exp537_borrowed.py,
+    raw_from_trace), built only from the routes, hidden states and logits the test drew.
+    ``history[s]`` = (hidden, logits, ids) of decode step s, on the CPU."""
+    feats = cfg.features
+    targets = list(cfg.target_layers)
+    o = feats.hidden_source_offset
+    hidden, logits, ids = history[t]
+    prior = torch.zeros(len(targets), E)
+    for s in range(t):  # the EMA over tokens 0 .. t-1, in FP32 as the offline builder
+        routes = history[s][2][targets, 0].long()
+        prior *= feats.ema_beta
+        prior.scatter_(1, routes, prior.gather(1, routes) + (1 - feats.ema_beta))
+    zeros = torch.zeros(len(targets), K, dtype=torch.long)  # serving resets prevwin to expert id 0
+    prev = [history[t - 1][2][[T - d for T in targets], 0].long() if t > 0 else zeros
+            for d in range(1, feats.previous_token_window + 1)]
+    rl = [torch.stack([torch.zeros(E, dtype=torch.float16) if T - d in feats.router_logit_layers_zeroed
+                       else logits[T - d, 0].half() for T in targets])
+          for d in range(1, feats.router_logit_window + 1)]
+    return dict(h=hidden[[T + o for T in targets], 0].half(), h_prev=hidden[[T + o - 1 for T in targets], 0].half(),
+                win=torch.stack([ids[[T - d for T in targets], 0].long() for d in range(1, feats.route_window + 1)], 1),
+                prevwin=torch.stack(prev, 1), curr=ids[targets, 0].long(), rl=torch.cat(rl, 1),
+                pos=torch.full((len(targets), 1), (t + 1) / feats.position_scale),
+                tid=torch.tensor([100 + t]), upcoming_tid=torch.tensor([200 + t]), prior_before=prior)
+
+
+def test_live_features_equal_the_offline_source_through_resets_and_replays():
+    """EXP540 live-feature gate, for the bundle in EXP526_EVICT_BUNDLE (the 36-row version 2 bundle).
+
+    The six L0-L5 rows were trained offline on the L6 head's inputs built by raw_from_trace. Here
+    every raw input of every head (h, h_prev, the route window, the previous token's routes with
+    zeros at token 0, the current routes, the router logits with L5 zero, position, token ids and
+    the EMA prior) must equal that offline definition exactly, after a graph warm-up, through two
+    requests (two resets) and graph replays. The prior advances exactly once per token, although
+    six rows share one source head, and each keep row equals its own row applied to the trunk
+    output of its source head. J = 1, the serve setting."""
+    from commitmoe_prefetch.qbank import qlinear
+    hooks, cache, _ = _hooks(1)
+    rows, rule, cfg = hooks.evict, hooks.learned, hooks.cfg
+    if rows.version != 2 or len(set(rows.source_layers)) == len(rows.source_layers):
+        pytest.skip('needs a version 2 bundle in which rows share a source head')
+    targets = list(cfg.target_layers)
+    inputs = _Inputs()
+    graph = _capture(hooks, cache, inputs)  # the eager warm-up and the capture run on reset state
+    generator = torch.Generator().manual_seed(6)
+    dev = torch.device('cuda')
+    for uid in (1, 2):
+        hooks.begin_request(uid)
+        history = []
+        for step in range(STEPS):
+            inputs.draw(generator)
+            history.append(tuple(x.cpu().clone() for x in (inputs.hidden, inputs.logits, inputs.ids)))
+            prior_before = hooks.raw['prior_before'].clone()
+            hooks.before_decode(step)
+            graph.replay()
+            torch.cuda.synchronize()
+            if step == 0:
+                assert int(rule.valid) == 0 and torch.equal(hooks.raw['prior_before'], prior_before)
+            else:
+                t = step - 1  # the replay of step s scores token s-1, the last token fully decoded
+                want = _offline_raw(cfg, history, t)
+                for name, value in want.items():
+                    got = prior_before if name == 'prior_before' else hooks.raw[name]
+                    assert torch.equal(got.cpu(), value.to(got.dtype)), (uid, step, name)
+                one_step = _offline_raw(cfg, history, t + 1)['prior_before']  # exactly one EMA advance
+                assert torch.equal(hooks.raw['prior_before'].cpu(), one_step), (uid, step)
+                g = hooks.bank.trunk({k: v.to(dev) for k, v in want.items()})
+                assert torch.equal(hooks.probs, hooks.bank.head(g))
+                for m, source in enumerate(rows.source_layers):
+                    head = targets.index(source)
+                    y = qlinear(g[head:head + 1].contiguous(), rows.codes[m:m + 1], rows.scale[m:m + 1],
+                                rows.bias[m:m + 1], rows.group)
+                    assert torch.equal(rule.keep[m], torch.sigmoid(y.float())[0]), (uid, step, rows.layers[m])
+                assert int(rule.valid) == 1
+            hooks.after_decode(step, torch.tensor([100 + step], device='cuda'),
+                               torch.tensor([200 + step], device='cuda'))
