@@ -106,10 +106,11 @@ def get_free_memory(device: torch.device) -> int:
 
 def memory_phase(device: torch.device, phase: str) -> str:
     """One machine-readable memory reading in raw bytes, logged at each init phase so a free-memory
-    deficit can be assigned to the phase that took it. Read-only on purpose: unlike
-    Engine._sync_get_memory it neither synchronizes nor empties the allocator cache nor resets the
-    peak counters, so adding a reading does not move any other reading. peak_reserved is the peak
-    since the last _sync_get_memory reset. device_free counts every process on the GPU."""
+    deficit can be located in the phase that took it. Unlike Engine._sync_get_memory it does not
+    synchronize, empty the allocator cache or reset the peak counters, so it does not explicitly
+    change allocator state or any sizing input. It is not atomic or synchronized: the queries take
+    time, and asynchronous or outside changes can still move later readings. peak_reserved is the
+    peak since the last _sync_get_memory reset. device_free counts every process on the GPU."""
     free, total = torch.cuda.mem_get_info(device)
     reading = dict(phase=phase, wall=round(time.time(), 3),
                    allocated=torch.cuda.memory_allocated(device), reserved=torch.cuda.memory_reserved(device),
