@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import json
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -100,6 +102,19 @@ def _determine_cuda_graph_bs(
 
 def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
+
+
+def memory_phase(device: torch.device, phase: str) -> str:
+    """One machine-readable memory reading in raw bytes, logged at each init phase so a free-memory
+    deficit can be assigned to the phase that took it. Read-only on purpose: unlike
+    Engine._sync_get_memory it neither synchronizes nor empties the allocator cache nor resets the
+    peak counters, so adding a reading does not move any other reading. peak_reserved is the peak
+    since the last _sync_get_memory reset. device_free counts every process on the GPU."""
+    free, total = torch.cuda.mem_get_info(device)
+    reading = dict(phase=phase, wall=round(time.time(), 3),
+                   allocated=torch.cuda.memory_allocated(device), reserved=torch.cuda.memory_reserved(device),
+                   peak_reserved=torch.cuda.max_memory_reserved(device), device_free=free, device_total=total)
+    return "MEMORY_PHASE " + json.dumps(reading, sort_keys=True)
 
 
 def torch_memory(device: torch.device) -> str:
@@ -212,6 +227,7 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
         logger.info_rank0(f"Torch memory after capturing CUDA graphs: {torch_memory(self.device)}")
+        logger.info_rank0(memory_phase(self.device, "after_capture"))
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs

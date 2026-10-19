@@ -28,7 +28,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory, torch_memory
+from .graph import GraphRunner, get_free_memory, memory_phase, torch_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -372,6 +372,7 @@ class Engine:
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
         logger.info_rank0(f"Torch memory before loading model: {torch_memory(self.device)}")
+        logger.info_rank0(memory_phase(self.device, "before_load"))
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -389,6 +390,7 @@ class Engine:
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
         post_weights_free = self._sync_get_memory()[0]
+        logger.info_rank0(memory_phase(self.device, "after_weights"))
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
@@ -408,10 +410,13 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        logger.info_rank0(memory_phase(self.device, "after_host_tables"))
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
+            logger.info_rank0(memory_phase(self.device, "after_moe_cache"))
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        logger.info_rank0(memory_phase(self.device, "after_prepare"))
         self.encoder_cache = None
         self.mm_processor = None
         if config.active_encoders:
@@ -445,6 +450,7 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        logger.info_rank0(memory_phase(self.device, "after_kv_pool"))
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -462,6 +468,7 @@ class Engine:
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
+        logger.info_rank0(memory_phase(self.device, "after_linear_state"))
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -488,6 +495,7 @@ class Engine:
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
         logger.info_rank0(f"Torch memory after initialization: {torch_memory(self.device)}")
+        logger.info_rank0(memory_phase(self.device, "after_init"))
 
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
@@ -665,6 +673,7 @@ class Engine:
         if self.decode_hooks is not None:
             charged = charge_reservation(self, self.decode_hooks)
             logger.info_rank0(f"decode hooks: {charged / 2**20:.1f} MiB charged to the weights before cache sizing")
+            logger.info_rank0(memory_phase(self.device, "after_hooks_reserve"))
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
