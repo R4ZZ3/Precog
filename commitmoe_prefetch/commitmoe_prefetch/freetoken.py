@@ -170,7 +170,7 @@ class PrefetchHooks(DecodeHooks):
         if self.evict_cfg is not None:
             path, start = self.evict_cfg
             self.evict = EvictRows(path, list(cfg.target_layers), cfg.architecture.up_dim, E,
-                                   cfg.serving_reference.int8_group, dev, self.release_sha256)
+                                   cfg.serving_reference.int8_group, dev, self.release_sha256, L)
             M = len(self.evict.layers)
             target_of_layer = torch.full((L,), -1, dtype=torch.int32)
             target_of_layer[self.evict.layers] = torch.arange(M, dtype=torch.int32)
@@ -182,8 +182,8 @@ class PrefetchHooks(DecodeHooks):
             self.stamps = torch.zeros(L + 3, dtype=torch.int64, device=dev)
             # Tokens whose keep scores were not all finite (published with valid = 0, so LRU).
             self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
-            logger.info('learned eviction: layers %s from layer %d, rows %.1f MiB (%s)', self.evict.layers,
-                        start, self.evict.nbytes / 2**20, path)
+            logger.info('learned eviction: layers %s (source heads %s) from layer %d, rows %.1f MiB (%s)',
+                        self.evict.layers, self.evict.source_layers, start, self.evict.nbytes / 2**20, path)
         logger.info('expert predictor: %d heads L%02d-L%02d, int8 bank %.1f MiB, stage %d MiB, caps %s',
                     H, self.first, L - 1, self.bank.nbytes / 2**20, STAGE_BYTES // 2**20, list(self.caps))
 

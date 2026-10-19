@@ -203,7 +203,8 @@ class RoutingRecorder(DecodeHooks):
         if self.keep is not None:
             learned = self.inner.learned
             record.update(keep=self.keep[:n].cpu(), keep_valid=self.keep_valid[:n].cpu(),
-                          evict_layers=list(self.inner.evict.layers), evict_start_layer=learned.start_layer,
+                          evict_layers=list(self.inner.evict.layers), evict_source_layers=list(self.inner.evict.source_layers),
+                          evict_start_layer=learned.start_layer,
                           evict_counters=learned.counters.cpu())
         if self.prefetch:
             # pump_stats columns: commitmoe_prefetch.kernels.STATS_FIELDS; demand_counters columns:

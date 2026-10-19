@@ -102,6 +102,17 @@ def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
 
+def torch_memory(device: torch.device) -> str:
+    """Allocator state next to device-wide free memory. Device free also counts other processes
+    and memory outside the Torch allocator (CUDA context, library workspaces), so the gap between
+    the two separates a Torch allocation change from a context or co-tenant change."""
+    free, total = torch.cuda.mem_get_info(device)
+    gib = 2**30
+    return (f"allocated {torch.cuda.memory_allocated(device) / gib:.3f} GiB, "
+            f"reserved {torch.cuda.memory_reserved(device) / gib:.3f} GiB, "
+            f"device free {free / gib:.3f} of {total / gib:.3f} GiB")
+
+
 class GraphRunner:
     def __init__(
         self,
@@ -200,6 +211,7 @@ class GraphRunner:
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        logger.info_rank0(f"Torch memory after capturing CUDA graphs: {torch_memory(self.device)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs

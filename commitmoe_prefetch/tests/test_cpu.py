@@ -196,3 +196,78 @@ def test_logger_reaches_the_server_log():
     """FreeToken's loggers do not propagate, so the request summaries need a FreeToken logger."""
     import logging
     assert ft.logger.isEnabledFor(logging.INFO) and ft.logger.handlers
+
+
+# --- learned eviction bundle loader (evict.EvictRows), versions 1 and 2 -------------------------
+# A small synthetic geometry: 40 layers, heads on L06-L39 as the release, 4 experts, 8 trunk units.
+_TARGETS, _E, _UP, _GROUP, _L = list(range(6, 40)), 4, 8, 4, 40
+
+
+def _bundle(path, version, layers, source_layers=None, **changes):
+    torch.manual_seed(0)
+    data = dict(version=version, layers=list(layers), horizon_tokens=8, release_sha256='a' * 64,
+                weight=torch.randn(len(layers), _E, _UP).bfloat16(), bias=torch.randn(len(layers), _E).bfloat16())
+    if source_layers is not None:
+        data['source_layers'] = list(source_layers)
+    data.update(changes)
+    torch.save(data, path)
+    return path
+
+
+def _rows(path, release='a' * 64):
+    from commitmoe_prefetch.evict import EvictRows
+    return EvictRows(path, _TARGETS, _UP, _E, _GROUP, torch.device('cpu'), release, _L)
+
+
+def test_evict_v1_reads_its_own_head(tmp_path):
+    # The exporter's provenance entry 'sources' is not a source-layer list and is ignored.
+    rows = _rows(_bundle(tmp_path / 'b.pt', 1, [8, 11, 39], sources={8: {'sha256': 'x'}}))
+    assert rows.source_layers == [8, 11, 39] and rows.heads.tolist() == [2, 5, 33]
+
+
+def test_evict_v2_rows_share_one_source(tmp_path):
+    rows = _rows(_bundle(tmp_path / 'b.pt', 2, [0, 1, 5, 8], source_layers=[6, 6, 6, 8]))
+    assert rows.layers == [0, 1, 5, 8] and rows.heads.tolist() == [0, 0, 0, 2]
+
+
+def test_evict_v2_codes_equal_v1_codes_of_the_same_rows(tmp_path):
+    """Version 2 changes only which trunk row is read; the quantized rows are the version 1 ones."""
+    v1 = _rows(_bundle(tmp_path / 'a.pt', 1, [8, 11]))
+    v2 = _rows(_bundle(tmp_path / 'b.pt', 2, [8, 11], source_layers=[8, 11]))
+    for name in ('codes', 'scale', 'bias', 'heads'):
+        assert torch.equal(getattr(v1, name), getattr(v2, name)), name
+
+
+@pytest.mark.parametrize('version, layers, sources, changes, message', [
+    (1, [0, 8], None, {}, r'source layers \[0\] have no prefetch head'),
+    (1, [8], [8], {}, 'version 1 bundle has source_layers'),
+    (2, [0, 8], None, {}, 'needs integer source_layers'),
+    (2, [0, 8], [6], {}, '1 source layers for 2 owner layers'),
+    (2, [0, 8], [5, 8], {}, r'source layers \[5\] have no prefetch head'),
+    (2, [8, 0], [8, 6], {}, 'ascending and unique'),
+    (2, [8, 8], [8, 8], {}, 'ascending and unique'),
+    (2, [0, 40], [6, 6], {}, r'owner layers \[40\] are not layers 0..39'),
+    (2, [0, 8], [6.0, 8], {}, 'needs integer source_layers'),
+    (2, [0, 8], [6, 8], dict(horizon_tokens=16), 'horizon 16 tokens'),
+    (2, [0, 8], [6, 8], dict(release_sha256='b' * 64), 'served release'),
+    (2, [0, 8], [6, 8], dict(weight=torch.full((2, _E, _UP), float('nan')).bfloat16()), 'non-finite weight'),
+    (2, [0, 8], [6, 8], dict(bias=torch.zeros(2, _E)), 'bias torch.float32'),
+    (3, [8], [8], {}, 'version 3'),
+])
+def test_evict_bundle_refusals(tmp_path, version, layers, sources, changes, message):
+    with pytest.raises(ValueError, match=message):
+        _rows(_bundle(tmp_path / 'b.pt', version, layers, sources, **changes))
+
+
+@pytest.mark.parametrize('bundle', [p for p in os.environ.get('EXP526_EVICT_BUNDLES', '').split(':') if p])
+def test_evict_released_bundles_load(bundle):
+    """The exported bundles (EXP526_EVICT_BUNDLES, ':'-separated) load against the published release."""
+    from commitmoe_prefetch.evict import EvictRows
+    if not (PUBLISHED / 'config.json').is_file():
+        pytest.skip('published folder absent')
+    cfg = PredictorConfig.model_validate(json.loads((PUBLISHED / 'config.json').read_text()))
+    release_sha256 = json.loads((PUBLISHED / 'manifest.json').read_text())['files']['model.safetensors']
+    rows = EvictRows(Path(bundle), list(cfg.target_layers), cfg.architecture.up_dim, cfg.base_model.num_experts,
+                     cfg.serving_reference.int8_group, torch.device('cpu'), release_sha256,
+                     cfg.base_model.num_layers)
+    assert len(rows.layers) == len(rows.source_layers) == rows.codes.shape[0]

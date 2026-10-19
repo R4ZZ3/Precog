@@ -200,7 +200,7 @@ def test_bundle_from_other_release_is_refused():
     cfg = _cfg()
     with pytest.raises(ValueError, match='served release'):
         EvictRows(BUNDLE, list(cfg.target_layers), cfg.architecture.up_dim, E, cfg.serving_reference.int8_group,
-                  torch.device('cuda'), release_sha256='0' * 64)
+                  torch.device('cuda'), release_sha256='0' * 64, num_layers=L)
 
 
 def test_flag_from_env():
@@ -213,13 +213,40 @@ def test_flag_from_env():
 
 
 def test_shapes_are_the_bank_shapes():
-    """One keep row per bundle layer, every bundle layer a predicted target layer."""
+    """One keep row per owner layer, every source layer a predicted target layer."""
     if not BUNDLE.is_file():
         pytest.skip('eviction bundle absent')
     from commitmoe_prefetch.evict import EvictRows
     cfg = _cfg()
     rows = EvictRows(BUNDLE, list(cfg.target_layers), cfg.architecture.up_dim, E,
-                     cfg.serving_reference.int8_group, torch.device('cuda'), release_sha256=None)
+                     cfg.serving_reference.int8_group, torch.device('cuda'), release_sha256=None, num_layers=L)
     assert rows.codes.shape == (len(rows.layers), E, cfg.architecture.up_dim)
-    assert all(cfg.target_layers[0] <= x < L for x in rows.layers)
+    assert all(0 <= x < L for x in rows.layers)
+    assert all(cfg.target_layers[0] <= x < L for x in rows.source_layers)
     assert K == cfg.base_model.top_k
+
+
+def test_v2_borrowed_rows_equal_the_rows_on_their_source_head(tmp_path):
+    """A version 2 row of owner L0-L5 with source L6 gives the keep score of the same row placed on
+    owner L6 in a version 1 bundle, bit for bit, also when six rows share the one source head."""
+    from commitmoe_prefetch.evict import EvictRows
+    cfg = _cfg()
+    up, group, targets = cfg.architecture.up_dim, cfg.serving_reference.int8_group, list(cfg.target_layers)
+    torch.manual_seed(0)
+    w = (torch.randn(7, E, up) * 0.02).bfloat16()
+    b = (torch.randn(7, E) * 0.5).bfloat16()
+    common = dict(horizon_tokens=8, release_sha256='a' * 64)
+    torch.save(dict(version=2, layers=[0, 1, 2, 3, 4, 5, 8], source_layers=[6] * 6 + [8], weight=w, bias=b,
+                    **common), tmp_path / 'v2.pt')
+    v2 = EvictRows(tmp_path / 'v2.pt', targets, up, E, group, torch.device('cuda'), 'a' * 64, L)
+    g = torch.randn(len(targets), up, device='cuda').bfloat16()
+    keep = torch.empty(7, E, device='cuda')
+    v2(g, keep)
+    for m, (owner, source) in enumerate(zip(v2.layers, v2.source_layers)):
+        torch.save(dict(version=1, layers=[source], weight=w[m:m + 1].clone(), bias=b[m:m + 1].clone(), **common),
+                   tmp_path / f'v1_{m}.pt')
+        v1 = EvictRows(tmp_path / f'v1_{m}.pt', targets, up, E, group, torch.device('cuda'), 'a' * 64, L)
+        one = torch.empty(1, E, device='cuda')
+        v1(g, one)
+        assert torch.equal(keep[m], one[0]), (owner, source)
+    assert torch.isfinite(keep).all() and not torch.equal(keep[0], keep[1])  # distinct rows, one source
