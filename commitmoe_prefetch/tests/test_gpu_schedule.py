@@ -70,34 +70,41 @@ class _Inputs:
                        .int())
 
 
-def _decode(hooks, cache, inputs, sleep=SLEEP_CYCLES, split=False):
+def _decode(hooks, cache, inputs, sleep=SLEEP_CYCLES, split=False, probe=None):
+    """``probe(layer, stage)``, if given, runs on the decode stream with stage 'before' just before
+    ensure_experts and 'after' when the layer's copy schedule and stand-in GEMM have ended. It must
+    only enqueue copies into preallocated buffers, so that it can be captured."""
     for layer in range(L):
         inputs.work[layer].copy_(inputs.ids[layer])
         hooks.observe(layer, inputs.hidden[layer], inputs.logits[layer], inputs.work[layer])
+        if probe:
+            probe(layer, 'before')
         cache.ensure_experts(layer, inputs.work[layer])
         if not split:
             assert hooks.copy_missing(cache, layer)
             if sleep:
                 torch.cuda._sleep(sleep)
-            continue
-        finish = hooks.begin_copy(cache, layer)
-        if sleep:
-            torch.cuda._sleep(sleep // 2)
-        finish()
-        if sleep:
-            torch.cuda._sleep(sleep // 2)
+        else:
+            finish = hooks.begin_copy(cache, layer)
+            if sleep:
+                torch.cuda._sleep(sleep // 2)
+            finish()
+            if sleep:
+                torch.cuda._sleep(sleep // 2)
+        if probe:
+            probe(layer, 'after')
 
 
-def _capture(hooks, cache, inputs, sleep=SLEEP_CYCLES, split=False):
+def _capture(hooks, cache, inputs, sleep=SLEEP_CYCLES, split=False, probe=None):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        _decode(hooks, cache, inputs, sleep, split)  # eager warmup, as the graph runner does
+        _decode(hooks, cache, inputs, sleep, split, probe)  # eager warmup, as the graph runner does
     torch.cuda.current_stream().wait_stream(side)
     hooks.begin_request(-1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _decode(hooks, cache, inputs, sleep, split)
+        _decode(hooks, cache, inputs, sleep, split, probe)
     return graph
 
 

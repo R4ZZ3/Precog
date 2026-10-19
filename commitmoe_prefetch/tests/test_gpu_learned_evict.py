@@ -287,7 +287,8 @@ def _offline_raw(cfg, history, t):
                 tid=torch.tensor([100 + t]), upcoming_tid=torch.tensor([200 + t]), prior_before=prior)
 
 
-def test_live_features_equal_the_offline_source_through_resets_and_replays():
+@pytest.mark.parametrize('split', [False, True])
+def test_live_features_equal_the_offline_source_through_resets_and_replays(split):
     """EXP540 live-feature gate, for the bundle in EXP526_EVICT_BUNDLE (the 36-row version 2 bundle).
 
     The six L0-L5 rows were trained offline on the L6 head's inputs built by raw_from_trace. Here
@@ -297,7 +298,8 @@ def test_live_features_equal_the_offline_source_through_resets_and_replays():
     requests (two resets) and replays that alternate between two graphs captured on the same hooks
     (as serving captures several graphs that share the hooks' buffers and events). The prior
     advances exactly once per token, although six rows share one source head, and each keep row
-    equals its own row applied to the trunk output of its source head. J = 1, the serve setting."""
+    equals its own row applied to the trunk output of its source head. J = 1, the serve setting.
+    ``split``: the same under the overlap schedule of FREETOKEN_OVERLAP_RESIDENT (EXP542)."""
     from commitmoe_prefetch.qbank import qlinear
     hooks, cache, _ = _hooks(1)
     rows, rule, cfg = hooks.evict, hooks.learned, hooks.cfg
@@ -306,7 +308,7 @@ def test_live_features_equal_the_offline_source_through_resets_and_replays():
     targets = list(cfg.target_layers)
     inputs = _Inputs()
     # Each capture runs its eager warm-up and leaves reset state; both graphs read the same buffers.
-    graphs = [_capture(hooks, cache, inputs) for _ in range(2)]
+    graphs = [_capture(hooks, cache, inputs, split=split) for _ in range(2)]
     generator = torch.Generator().manual_seed(6)
     dev = torch.device('cuda')
     for uid in (1, 2):
@@ -371,3 +373,88 @@ def test_copy_never_writes_a_resident_route_slot(start_layer):
         assert _check_resident_rows(cache, hosts) > 0
         hooks.after_decode(step, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
     assert checked > 0 and hooks.learned.counters[2] > 0  # resident routes seen and slots rescued
+
+
+_MAPS = ('slot_for_id', 'id_of_slot', 'usage', 'step')
+
+
+def _event_probe(cache, rule, inputs):
+    """Preallocated buffers and a capturable probe (test_gpu_schedule._decode) that keeps, per layer,
+    the hit bit of each route just before ensure_experts, and, when the layer has ended, the cache
+    maps (slots, ages, clock), the victim slots and copy sources, and the learned-rule counters."""
+    dev = torch.device('cuda')
+    plain = {n: getattr(cache, n) for n in (*_MAPS, 'num_indices', 'evict_slots', 'src_indices')}
+    plain['counters'] = rule.counters
+    bufs = {n: torch.zeros((L, *t.shape), dtype=t.dtype, device=dev) for n, t in plain.items()}
+    bufs['hit'] = torch.zeros(L, K, dtype=torch.bool, device=dev)
+
+    def probe(layer, stage):
+        if stage == 'before':
+            ids = inputs.ids[layer, 0].long()
+            bufs['hit'][layer].copy_(cache.slot_for_id[layer].index_select(0, ids) >= 0)
+            return
+        for name, t in plain.items():
+            bufs[name][layer].copy_(t)
+    return bufs, probe
+
+
+def _events(bufs) -> list[dict]:
+    """The per-layer records of one replayed token, on the CPU. evict_slots and src_indices are
+    read only up to num_indices: the entries past it are stale plan scratch, not decisions."""
+    host = {n: t.cpu() for n, t in bufs.items()}
+    out = []
+    for layer in range(L):
+        n = int(host['num_indices'][layer, 0])
+        out.append(dict(hit=host['hit'][layer], counters=host['counters'][layer],
+                        victims=host['evict_slots'][layer, :n], sources=host['src_indices'][layer, :n],
+                        **{m: host[m][layer] for m in _MAPS}))
+    return out
+
+
+def test_split_equals_one_pass_at_every_event():
+    """EXP542 parity gate, J = 1, with the bundle in EXP526_EVICT_BUNDLE (the 36-row version 2 bundle
+    for EXP542). The overlap schedule changes when the expert GEMM runs, never which expert a slot
+    holds. Fed the same routes, hidden states and logits, the one-pass and the split schedule must
+    give, at every layer of every token, the same hit bits, victim slots, copy sources, slot maps,
+    ages, clock and learned-rule counters; and per token the same published keep scores, valid flag,
+    probabilities and decode summary (stage and host misses, copies, publications). Two graphs
+    captured on the same hooks alternate through two requests (two resets), as in serving. Token
+    end maps alone (test_gpu_schedule.test_split_keeps_the_cache_decisions, plain LRU) cannot show a
+    difference that a later layer of the same token repairs; this test reads each event."""
+    runs = []
+    for split in (False, True):
+        hooks, cache, hosts = _hooks(1)
+        rule = hooks.learned
+        inputs = _Inputs()
+        bufs, probe = _event_probe(cache, rule, inputs)
+        graphs = [_capture(hooks, cache, inputs, split=split, probe=probe) for _ in range(2)]
+        generator = torch.Generator().manual_seed(8)
+        tokens = []
+        for uid in (1, 2):
+            hooks.begin_request(uid)
+            for step in range(STEPS):
+                inputs.draw(generator)
+                hooks.before_decode(step)
+                graphs[(uid + step) % 2].replay()
+                torch.cuda.synchronize()
+                assert _check_resident_rows(cache, hosts) > 0
+                tokens.append(dict(events=_events(bufs), keep=rule.keep.cpu(), valid=int(rule.valid),
+                                   probs=hooks.probs.cpu(), summary=hooks.summary()))
+                hooks.after_decode(step, torch.tensor([100 + step], device='cuda'),
+                                   torch.tensor([200 + step], device='cuda'))
+        runs.append(tokens)
+        del hooks, cache, hosts, graphs
+    one_pass, split = runs
+    assert len(one_pass) == len(split) == 2 * STEPS
+    for t, (a, b) in enumerate(zip(one_pass, split)):
+        assert a['valid'] == b['valid'] and a['summary'] == b['summary'], (t, a['summary'], b['summary'])
+        assert torch.equal(a['keep'], b['keep']) and torch.equal(a['probs'], b['probs']), t
+        for layer, (x, y) in enumerate(zip(a['events'], b['events'])):
+            for name, value in x.items():
+                assert torch.equal(value, y[name]), (t, layer, name)
+    # The comparison is not vacuous: misses, victims and learned reranks happened at J and above.
+    last = one_pass[-1]['events'][-1]
+    events, reranked, rescued = last['counters'].tolist()
+    assert events > 0 and reranked > 0 and rescued > 0, last['counters']
+    assert any(not bool(e['hit'].all()) for tok in one_pass for e in tok['events'])
+    assert any(len(e['victims']) for tok in one_pass for e in tok['events'])
