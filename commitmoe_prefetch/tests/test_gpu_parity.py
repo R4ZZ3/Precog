@@ -86,10 +86,20 @@ def test_capture_layer_equals_research(legacy):
 
 
 def _bank_rows(dev):
-    # The FP8 expert row of the served model: gate_up, its scales, down, its scales (bytes).
+    """Host rows of every bank and the per-layer base pointers into them.
+
+    The rows have the FP8 expert sizes of the served model (gate_up, its scales, down, its scales,
+    in bytes), so a copy spans several CHUNK_BYTES chunks as in serving. One full row per
+    (layer, expert) would need 40 x 256 x 3.00 MiB = 30 GiB, more than the GPU. So the layer blocks
+    overlap: layer l starts at row l, and expert e of layer l is row l + e (296 rows, 888 MiB). Both
+    kernels read through the same pointers, and a read at another layer or expert lands on another
+    random row, unless the layer and expert errors cancel exactly.
+    """
     sizes = [2 * 512 * D, 8 * 16 * 4, D * 512, 16 * 4 * 4]
-    hosts = [torch.randint(0, 255, (L * E, s), dtype=torch.uint8, device=dev) for s in sizes]
-    return sizes, hosts
+    hosts = [torch.randint(0, 255, (L + E, s), dtype=torch.uint8, device=dev) for s in sizes]
+    ptrs = torch.tensor([[h.data_ptr() + layer * s for h, s in zip(hosts, sizes)] for layer in range(L)],
+                        dtype=torch.int64, device=dev)
+    return sizes, hosts, ptrs
 
 
 @pytest.mark.parametrize('section,cap', [(0, 2), (3, 2), (6, 3)])
@@ -98,9 +108,7 @@ def test_select_retire_pump_equal_research(legacy, section, cap):
     old_select, old_pump = legacy[0], legacy[1]
     dev = torch.device('cuda')
     torch.manual_seed(section)
-    sizes, hosts = _bank_rows(dev)
-    host_ptrs = torch.tensor([[h.data_ptr() + layer * E * s for h, s in zip(hosts, sizes)] for layer in range(L)],
-                             dtype=torch.int64, device=dev)
+    sizes, hosts, host_ptrs = _bank_rows(dev)  # hosts must stay alive while the kernels read them
     sizes_t = torch.tensor(sizes, dtype=torch.int64, device=dev)
     slot_for_id = torch.where(torch.rand(L * E, device=dev) < 0.7, 1, -1).to(torch.int32)
     probs = torch.rand(34, E, device=dev)

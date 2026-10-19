@@ -286,10 +286,11 @@ def test_live_features_equal_the_offline_source_through_resets_and_replays():
     The six L0-L5 rows were trained offline on the L6 head's inputs built by raw_from_trace. Here
     every raw input of every head (h, h_prev, the route window, the previous token's routes with
     zeros at token 0, the current routes, the router logits with L5 zero, position, token ids and
-    the EMA prior) must equal that offline definition exactly, after a graph warm-up, through two
-    requests (two resets) and graph replays. The prior advances exactly once per token, although
-    six rows share one source head, and each keep row equals its own row applied to the trunk
-    output of its source head. J = 1, the serve setting."""
+    the EMA prior) must equal that offline definition exactly, after the graph warm-ups, through two
+    requests (two resets) and replays that alternate between two graphs captured on the same hooks
+    (as serving captures several graphs that share the hooks' buffers and events). The prior
+    advances exactly once per token, although six rows share one source head, and each keep row
+    equals its own row applied to the trunk output of its source head. J = 1, the serve setting."""
     from commitmoe_prefetch.qbank import qlinear
     hooks, cache, _ = _hooks(1)
     rows, rule, cfg = hooks.evict, hooks.learned, hooks.cfg
@@ -297,7 +298,8 @@ def test_live_features_equal_the_offline_source_through_resets_and_replays():
         pytest.skip('needs a version 2 bundle in which rows share a source head')
     targets = list(cfg.target_layers)
     inputs = _Inputs()
-    graph = _capture(hooks, cache, inputs)  # the eager warm-up and the capture run on reset state
+    # Each capture runs its eager warm-up and leaves reset state; both graphs read the same buffers.
+    graphs = [_capture(hooks, cache, inputs) for _ in range(2)]
     generator = torch.Generator().manual_seed(6)
     dev = torch.device('cuda')
     for uid in (1, 2):
@@ -308,7 +310,7 @@ def test_live_features_equal_the_offline_source_through_resets_and_replays():
             history.append(tuple(x.cpu().clone() for x in (inputs.hidden, inputs.logits, inputs.ids)))
             prior_before = hooks.raw['prior_before'].clone()
             hooks.before_decode(step)
-            graph.replay()
+            graphs[(uid + step) % 2].replay()  # request 2 starts on the other graph
             torch.cuda.synchronize()
             if step == 0:
                 assert int(rule.valid) == 0 and torch.equal(hooks.raw['prior_before'], prior_before)
