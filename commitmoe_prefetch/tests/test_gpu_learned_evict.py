@@ -411,19 +411,24 @@ def _events(bufs) -> list[dict]:
     return out
 
 
-def test_split_equals_one_pass_at_every_event():
+def test_split_equals_one_pass_at_every_event(record_property):
     """EXP542 parity gate, J = 1, with the bundle in EXP526_EVICT_BUNDLE (the 36-row version 2 bundle
     for EXP542). The overlap schedule changes when the expert GEMM runs, never which expert a slot
     holds. Fed the same routes, hidden states and logits, the one-pass and the split schedule must
     give, at every layer of every token, the same hit bits, victim slots, copy sources, slot maps,
     ages, clock and learned-rule counters; and per token the same published keep scores, valid flag,
-    probabilities and decode summary (stage and host misses, copies, publications). Two graphs
+    probabilities and decision counters. Transport counters may differ with stream timing;
+    their accounting is checked independently. Two graphs
     captured on the same hooks alternate through two requests (two resets), as in serving. Token
     end maps alone (test_gpu_schedule.test_split_keeps_the_cache_decisions, plain LRU) cannot show a
     difference that a later layer of the same token repairs; this test reads each event."""
-    runs = []
+    from summary_contract import compare_summaries
+
+    runs, geometry = [], []
     for split in (False, True):
         hooks, cache, hosts = _hooks(1)
+        geometry.append((sum(host.stride(0) * host.element_size() for host in hosts),
+                         sum(hooks.caps), hooks.cfg.serving_reference.first_prefetch_step))
         rule = hooks.learned
         inputs = _Inputs()
         bufs, probe = _event_probe(cache, rule, inputs)
@@ -446,12 +451,24 @@ def test_split_equals_one_pass_at_every_event():
         del hooks, cache, hosts, graphs
     one_pass, split = runs
     assert len(one_pass) == len(split) == 2 * STEPS
+    assert geometry[0] == geometry[1]
+    row_bytes, capacity, first_step = geometry[0]
+    misses, previous, transport = 0, None, []
     for t, (a, b) in enumerate(zip(one_pass, split)):
-        assert a['valid'] == b['valid'] and a['summary'] == b['summary'], (t, a['summary'], b['summary'])
+        assert a['valid'] == b['valid'], t
         assert torch.equal(a['keep'], b['keep']) and torch.equal(a['probs'], b['probs']), t
         for layer, (x, y) in enumerate(zip(a['events'], b['events'])):
             for name, value in x.items():
                 assert torch.equal(value, y[name]), (t, layer, name)
+        step = t % STEPS
+        if step == 0:
+            misses, previous = 0, None
+        misses += sum(int((~event['hit']).sum()) for event in a['events'])
+        diagnostics = compare_summaries(a['summary'], b['summary'], misses=misses, row_bytes=row_bytes,
+                                        copy_budget=capacity * max(0, step + 1 - first_step), previous=previous)
+        transport.append(dict(request=t // STEPS, step=step, **diagnostics))
+        previous = (a['summary'], b['summary'])
+    record_property('prefetch_transport_counters', json.dumps(transport, sort_keys=True))
     # The comparison is not vacuous: misses, victims and learned reranks happened at J and above.
     last = one_pass[-1]['events'][-1]
     events, reranked, rescued = last['counters'].tolist()
