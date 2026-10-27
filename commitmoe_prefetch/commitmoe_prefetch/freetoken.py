@@ -30,6 +30,17 @@ Learned eviction (EXP526, off by default; on when FREETOKEN_LEARNED_EVICT names 
       L == J    observe() makes main wait for the scores-ready event before L's ensure.
       L >= J    ensure_experts chooses victims with learned_evict.learned_ensure; layers below
                 J use the unchanged LRU rule. J is FREETOKEN_LEARNED_EVICT_START (required).
+
+Shared learned eviction (EXP585, off by default; on when FREETOKEN_SHARED_EVICT names a bundle of
+experiments/exp585_export.py; refused together with FREETOKEN_LEARNED_EVICT):
+      L == 0    observe() snapshots the slot map on main (resident = slot >= 0): main has run every
+                cache mutation of token t (its graph joined the demand and probe streams at the
+                last layer), and none of token t+1 yet (L0's ensure follows observe). Then the
+                probe stream forks and runs shared_evict.SharedEvict: advance the 40-layer eviction
+                EMA and age with token t's routes (step > 0 only), score all 40 layers from R584's
+                own trunk, publish valid = (step > 0) & finite, record scores-ready, and only then
+                run the prefetch bank (trunk and head) and its EMA prior, unchanged.
+      L == J    as above; every layer >= J reads its keep row (J from FREETOKEN_LEARNED_EVICT_START).
 """
 from __future__ import annotations
 
@@ -49,7 +60,9 @@ from freetoken.utils import init_logger
 
 from . import bank_loader, hub, kernels
 from .evict import EvictRows
-from .qbank import Int8Bank
+from .qbank import Int8Bank, qlinear
+from .shared_evict import SharedEvict
+from .shared_evict import load_bundle as load_shared_bundle
 from .spec import PredictorConfig
 
 if TYPE_CHECKING:
@@ -78,6 +91,8 @@ EVICT_ENV, EVICT_START_ENV = 'FREETOKEN_LEARNED_EVICT', 'FREETOKEN_LEARNED_EVICT
 # kernels slow main down: confirm the chosen J with the plain timing). The rows of all tokens so
 # far are written when the next request begins, so the last request of a run is not written.
 EVICT_TIMING_ENV, EVICT_TIMING_ALL_ENV = 'FREETOKEN_LEARNED_EVICT_TIMING', 'FREETOKEN_LEARNED_EVICT_TIMING_ALL'
+# Shared learned eviction switch (EXP585): an exp585_export.py bundle path. It uses EVICT_START_ENV for J.
+SHARED_EVICT_ENV = 'FREETOKEN_SHARED_EVICT'
 
 
 class PrefetchHooks(DecodeHooks):
@@ -87,7 +102,7 @@ class PrefetchHooks(DecodeHooks):
 
     def __init__(self, cfg: PredictorConfig, state: dict[str, torch.Tensor], demand_stripes: int,
                  evict: tuple[Path, int] | None = None, timing: Path | None = None, timing_all: bool = False,
-                 release_sha256: str | None = None):
+                 release_sha256: str | None = None, shared: tuple[Path, int] | None = None):
         base, feats = cfg.base_model, cfg.features
         layers, sl = base.num_layers, kernels.SECTION_LAYERS
         targets = cfg.target_layers
@@ -104,8 +119,12 @@ class PrefetchHooks(DecodeHooks):
             problems.append('--moe-demand-copy-stripes must be at least 1')
         if evict is not None and not 0 <= evict[1] < layers:
             problems.append(f'{EVICT_START_ENV}={evict[1]} is not a layer 0..{layers - 1}')
-        if timing is not None and evict is None:
-            problems.append(f'{EVICT_TIMING_ENV} needs {EVICT_ENV}')
+        if evict is not None and shared is not None:
+            problems.append(f'{EVICT_ENV} and {SHARED_EVICT_ENV} are two eviction rules; set one')
+        if shared is not None and not 0 <= shared[1] < layers:
+            problems.append(f'{EVICT_START_ENV}={shared[1]} is not a layer 0..{layers - 1}')
+        if timing is not None and evict is None and shared is None:
+            problems.append(f'{EVICT_TIMING_ENV} needs {EVICT_ENV} or {SHARED_EVICT_ENV}')
         if problems:
             raise ValueError('expert predictor: ' + '; '.join(problems))
         self.cfg, self._state, self.demand_stripes = cfg, state, demand_stripes
@@ -124,6 +143,8 @@ class PrefetchHooks(DecodeHooks):
         self.stamp_rows: list[torch.Tensor] = []
         self.stamp_steps: list[int] = []
         self.learned: LearnedEvict | None = None
+        self.shared_cfg = shared
+        self.shared: SharedEvict | None = None
 
     # -- setup ---------------------------------------------------------------------
 
@@ -186,6 +207,25 @@ class PrefetchHooks(DecodeHooks):
             self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
             logger.info('learned eviction: layers %s (source heads %s) from layer %d, rows %.1f MiB (%s)',
                         self.evict.layers, self.evict.source_layers, start, self.evict.nbytes / 2**20, path)
+        if self.shared_cfg is not None:
+            path, start = self.shared_cfg
+            meta, tensors = load_shared_bundle(path, self.release_sha256, L, E, K, base.hidden_size,
+                                               self.bank.buffers['table'],
+                                               feats.position_scale, cfg.serving_reference.int8_group)
+            self.shared = SharedEvict(meta, tensors, dev, qlinear)
+            del tensors
+            # End-of-token-t residency (slot >= 0, the rule of the overlap path), written on main in observe(0).
+            self.resident = torch.zeros(L, E, dtype=torch.float32, device=dev)
+            self.learned = LearnedEvict(keep=torch.zeros(L, E, dtype=torch.float32, device=dev),
+                                        valid=torch.zeros(1, dtype=torch.int32, device=dev),
+                                        target_of_layer=torch.arange(L, dtype=torch.int32, device=dev),
+                                        start_layer=start,
+                                        counters=torch.zeros(len(EVICT_COUNTERS), dtype=torch.int64, device=dev))
+            self.scores_ready = torch.cuda.Event()
+            self.stamps = torch.zeros(L + 3, dtype=torch.int64, device=dev)
+            self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
+            logger.info('shared learned eviction: all %d layers from layer %d, R584 %.1f MiB (%s)',
+                        L, start, self.shared.nbytes / 2**20, path)
         logger.info('expert predictor: %d heads L%02d-L%02d, int8 bank %.1f MiB, stage %d MiB, caps %s',
                     H, self.first, L - 1, self.bank.nbytes / 2**20, STAGE_BYTES // 2**20, list(self.caps))
 
@@ -209,6 +249,11 @@ class PrefetchHooks(DecodeHooks):
         words = sum(int(b) // 8 for b in cache._copy_feat_bytes.tolist())
         chunks = triton.cdiv(words, kernels.CHUNK_BYTES // 8)  # chunks per expert
         self.quota = kernels.SLOTS * chunks  # one pump call may try every chunk of a full section
+        if self.shared is not None:
+            if tuple(cache.slot_for_id.shape) != tuple(self.resident.shape):
+                raise ValueError(f'shared eviction: slot map {tuple(cache.slot_for_id.shape)}, '
+                                 f'expected {tuple(self.resident.shape)}')
+            self.cache = cache  # observe(0) snapshots its slot map; bind runs again after a cache rebuild
         cache.learned_evict = self.learned
         self.begin_request(-1)
 
@@ -251,6 +296,9 @@ class PrefetchHooks(DecodeHooks):
             self.learned.valid.zero_()
             self.learned.counters.zero_()
             self.nonfinite_tokens.zero_()
+            if self.shared is not None:
+                self.shared.reset()
+                self.resident.zero_()
 
     def before_decode(self, step: int) -> None:
         self.step.fill_(step)
@@ -303,6 +351,9 @@ class PrefetchHooks(DecodeHooks):
         if self.timing_all:
             kernels.stamp[(1,)](self.stamps, IDX=layer_id)
         if layer_id == 0:
+            if self.shared is not None:
+                # Before the fork, so the probe reads token t's residency (see the module docstring).
+                self.resident.copy_(self.cache.slot_for_id >= 0)
             # The scores read only the frozen end-of-token-t inputs, never this capture.
             self.probe_stream.wait_stream(main)
             with torch.cuda.stream(self.probe_stream):
@@ -334,6 +385,9 @@ class PrefetchHooks(DecodeHooks):
         raw['rl'].copy_(torch.cat([rl[lo - d:hi - d] for d in range(1, feats.router_logit_window + 1)], 1))
         if self.learned is None:
             self.probs.copy_(self.bank(raw))
+        elif self.shared is not None:
+            self._score_shared()
+            self.probs.copy_(self.bank(raw))
         else:
             g = self.bank.trunk(raw)
             keep = self.learned.keep
@@ -355,6 +409,21 @@ class PrefetchHooks(DecodeHooks):
         prior.mul_(beta)
         prior.scatter_(1, raw['curr'], prior.gather(1, raw['curr']) + (1 - beta))
         prior.copy_(torch.where(self.step > 0, prior, before))
+
+    def _score_shared(self) -> None:
+        """R584 keep scores of all layers (EXP585), published before the prefetch bank runs."""
+        raw, inputs, keep = self.raw, self.score_inputs, self.learned.keep
+        self.shared.advance(inputs['routes'], self.step)
+        keep.copy_(self.shared.scores(self.shared.own(self.resident), inputs['h'], raw['tid'], raw['upcoming_tid'],
+                                      raw['pos'][:1], self.bank.buffers['table']))
+        # As in the EvictRows path: step 0 is never valid; a non-finite token falls back to LRU and is counted.
+        finite = torch.isfinite(keep).all()
+        scored = self.step[0] > 0
+        self.learned.valid.copy_((scored & finite).to(torch.int32).view(1))
+        self.nonfinite_tokens.add_((scored & ~finite).to(torch.int64))
+        if self.timing is not None:
+            kernels.stamp[(1,)](self.stamps, IDX=self.cfg.base_model.num_layers)
+        self.scores_ready.record()
 
     def copy_missing(self, cache: OffloadMoeCache, layer_id: int) -> bool:
         main = torch.cuda.current_stream()
@@ -458,7 +527,8 @@ def create_decode_hooks(source: str, config: EngineConfig) -> PrefetchHooks:
     timing = os.environ.get(EVICT_TIMING_ENV)
     release = json.loads((folder / 'manifest.json').read_text())['files']['model.safetensors']  # verified above
     return PrefetchHooks(cfg, state, config.moe_demand_copy_stripes, evict_from_env(os.environ),
-                         Path(timing) if timing else None, os.environ.get(EVICT_TIMING_ALL_ENV) == '1', release)
+                         Path(timing) if timing else None, os.environ.get(EVICT_TIMING_ALL_ENV) == '1', release,
+                         shared_evict_from_env(os.environ))
 
 
 def evict_from_env(env) -> tuple[Path, int] | None:
@@ -469,4 +539,17 @@ def evict_from_env(env) -> tuple[Path, int] | None:
     start = env.get(EVICT_START_ENV)
     if start is None:
         raise ValueError(f'{EVICT_ENV} is set; {EVICT_START_ENV} must give the first learned layer')
+    return Path(bundle), int(start)
+
+
+def shared_evict_from_env(env) -> tuple[Path, int] | None:
+    """(bundle, J) when shared learned eviction (EXP585) is switched on, else None."""
+    bundle = env.get(SHARED_EVICT_ENV)
+    if not bundle:
+        return None
+    if env.get(EVICT_ENV):
+        raise ValueError(f'{EVICT_ENV} and {SHARED_EVICT_ENV} are two eviction rules; set one')
+    start = env.get(EVICT_START_ENV)
+    if start is None:
+        raise ValueError(f'{SHARED_EVICT_ENV} is set; {EVICT_START_ENV} must give the first learned layer')
     return Path(bundle), int(start)
