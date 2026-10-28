@@ -283,6 +283,11 @@ class FakeShared(FakeInner):
             self.mutations += 1
         self.live_h[layer_id] = hidden.float().half()[0]
 
+    def begin_request(self, uid):
+        super().begin_request(uid)
+        for t in (*self.score_inputs.values(), *self.raw.values()):  # the real hook zeroes these too
+            t.zero_()
+
     def after_decode(self, step, consumed, sampled):
         super().after_decode(step, consumed, sampled)
         self.score_inputs["h"].copy_(self.live_h)
@@ -349,6 +354,76 @@ def test_shared_mode_refuses_bad_hidden_and_age_range(tmp_path):
     rec.observe(1, torch.zeros(1, D, dtype=torch.bfloat16), None, ids(1, 2))
     with pytest.raises(RuntimeError, match="dtype"):
         rec.observe(2, torch.zeros(1, D, dtype=torch.float16), None, ids(1, 2))
+
+
+def test_shared_mode_refuses_a_producer_dtype_that_fp32_does_not_hold(tmp_path):
+    cache = make_cache()
+    rec = RoutingRecorder(FakeShared(cache), tmp_path, top_k=K, capacity=4)
+    rec.bind(None, cache)
+    with pytest.raises(RuntimeError, match="not exact in FP32"):
+        rec.observe(1, torch.zeros(1, D, dtype=torch.float64), None, ids(1, 2))
+    assert rec.p4_producer_dtype is None  # the refused call names no source dtype
+    rec.observe(1, torch.zeros(1, D, dtype=torch.float32), None, ids(1, 2))
+    assert rec.p4_producer_dtype == "torch.float32"
+
+
+def test_shared_mode_counts_ages_outside_the_index_range_before_the_int16_cast(tmp_path):
+    cache = make_cache()
+    inner = FakeShared(cache, far=7)
+    rec = RoutingRecorder(inner, tmp_path, top_k=K, capacity=4)
+    rec.bind(None, cache)
+    rec.begin_request(1)
+    shared_step(rec, inner, 0, 40)  # ages 0: inside 0..far
+    rec.before_decode(1)
+    inner.shared.age.fill_(7)  # far itself is inside the range
+    inner.shared.age[0, 0] = -1
+    inner.shared.age[1, 3] = 65536  # wraps to 0 in int16: a plausible age without the count
+    inner.shared.age[2, 4] = 8
+    for layer in range(L):
+        rec.observe(layer, torch.zeros(1, D, dtype=torch.bfloat16), None, ids(layer, layer))
+    rec.after_decode(1, torch.tensor([41]), torch.tensor([42]))
+    rec.begin_request(2)
+    record = torch.load(files(tmp_path)[0])
+    assert record["p4_age_out_of_range"].tolist() == [0, 3]
+    assert record["p4_age_out_of_range"].dtype == torch.int32
+    assert record["p4_age"][1, 1, 3].item() == 0 and record["p4_age"][1, 0, 0].item() == -1
+
+
+def test_shared_mode_lifecycle_over_capacity_and_two_requests(tmp_path):
+    cache = make_cache()
+    inner = FakeShared(cache)
+    rec = RoutingRecorder(inner, tmp_path, top_k=K, capacity=2)
+    rec.bind(None, cache)
+    rec.observe(1, torch.full((1, D), 9.0, dtype=torch.bfloat16), None, ids(9, 9))  # warmup: scratch row
+    rec.begin_request(5)
+    for step in range(3):  # step 2 overflows the capacity of 2 rows
+        shared_step(rec, inner, step, 40 + step)
+    rec.observe(2, torch.full((1, D), 8.0, dtype=torch.bfloat16), None, ids(8, 8))  # stray: scratch row
+    rec.begin_request(6)
+    for step in range(2):
+        shared_step(rec, inner, step, 60 + step)
+    rec.begin_request(7)
+    first, second = (torch.load(p) for p in files(tmp_path))
+    assert first["overflow"] is True and first["steps"] == 3 and second["overflow"] is False
+    for record, base in ((first, 0), (second, 0)):
+        n = record["ids"].shape[0]
+        assert n == 2 and all(v.shape[0] == n for k, v in record.items() if k.startswith("p4_")
+                              and isinstance(v, torch.Tensor))
+        # rows and ids stay aligned: ids at layer 0 route (0, 1) every step; producer per step
+        assert record["ids"][:, 0].tolist() == [[0, 1], [0, 1]]
+        want = torch.tensor([[1.3 + s, 2.3 + s] for s in range(2)], dtype=torch.bfloat16).float()
+        assert torch.equal(record["p4_producer"][:, :, 0], want)
+    # no warmup, overflow or stray value reaches an exported row
+    for record in (first, second):
+        assert not (record["p4_producer"] == 9.0).any() and not (record["p4_producer"] == 8.0).any()
+        # step 2's layer-1 value (step 1's layer-2 value is the same number, so test layer 1 only)
+        assert not (record["p4_producer"][:, 0] == torch.tensor(1.3 + 2, dtype=torch.bfloat16).float()).any()
+    assert first["p4_consumed"].tolist() == [40, 41] and second["p4_consumed"].tolist() == [60, 61]
+    # the second request's step 0 read reset frozen inputs, not the first request's last values
+    assert second["p4_h"][0].abs().sum().item() == 0 and second["p4_routes"][0].abs().sum().item() == 0
+    assert second["p4_tid"][0].item() == 0 and second["p4_pos"][0].item() == 0
+    assert torch.equal(second["p4_h"][1], second["p4_producer"][0].half())
+    assert second["p4_tid"][1].item() == 60
 
 
 def test_rows_mode_export_names_its_rows_and_has_no_p4(tmp_path):

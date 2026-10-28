@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 
 SCHEMA = 1
 P4_SCHEMA = 1
+EXACT_IN_FP32 = (torch.bfloat16, torch.float16, torch.float32)  # producer dtypes that FP32 rows hold exactly
 # scores[r] are the predictor scores the forward of decode step r used: computed at its layer 0
 # from the inputs frozen after step r - 1. Row 0 scores reset (zero) inputs and forecasts nothing.
 SCORE_CLOCK = "scores[r]: used by decode step r, computed from inputs frozen after step r-1; row 0 has reset inputs"
@@ -116,10 +117,13 @@ class RoutingRecorder(DecodeHooks):
           direct    (C+1, L, E) uint8: slot_for_id >= 0 read in observe(0) before the inner hook, so at
                     the same main-stream point where the inner hook snapshots its resident mask.
           producer  (C+1, n_h, D) FP32: the hidden argument of observe() at R584's hidden-source
-                    layers. FP32 holds bf16/fp16 values exactly; p4_producer_dtype names the source.
+                    layers. Only bf16, fp16 and FP32 are accepted: FP32 holds them exactly, so the
+                    rows are the native values; p4_producer_dtype names the source dtype.
         The rest is copied in after_decode before the inner after_decode overwrites the frozen
         inputs, so each row holds what this step's scorer read and the state it left:
-          resident (uint8, plus resident_nonbinary: entries not 0 or 1), ema (FP32), age (int16),
+          resident (uint8, plus resident_nonbinary: entries not 0 or 1), ema (FP32), age (int16,
+          plus age_out_of_range: entries outside 0..far, counted on the source values before the
+          narrowing, which would otherwise wrap a corrupt age into a plausible one),
           routes (score_inputs routes), h (score_inputs h at the hidden-source layers, fp16), tid,
           upcoming_tid, pos, and the step's consumed and sampled ids.
         """
@@ -130,6 +134,7 @@ class RoutingRecorder(DecodeHooks):
         far = int(shared.far)
         if not 0 <= far <= torch.iinfo(torch.int16).max:
             raise ValueError(f"routing recorder: R584 age index range 0..{far} does not fit int16")
+        self.p4_far = far
         self.p4_layers = [int(v) for v in shared.hidden_layers.tolist()]
         self.p4_producer_dtype = None
         D = self.inner.score_inputs["h"].shape[1]
@@ -138,6 +143,7 @@ class RoutingRecorder(DecodeHooks):
         return dict(direct=z(C + 1, L, E, dtype=torch.uint8), producer=z(C + 1, n_h, D, dtype=torch.float32),
                     resident=z(C, L, E, dtype=torch.uint8), resident_nonbinary=z(C, dtype=torch.int32),
                     ema=z(C, L, E, dtype=torch.float32), age=z(C, L, E, dtype=torch.int16),
+                    age_out_of_range=z(C, dtype=torch.int32),
                     routes=z(C, L, K, dtype=torch.int64), h=z(C, n_h, D, dtype=torch.float16),
                     tid=z(C, dtype=torch.int64), upcoming_tid=z(C, dtype=torch.int64), pos=z(C, dtype=torch.float32),
                     consumed=z(C, dtype=torch.int64), sampled=z(C, dtype=torch.int64))
@@ -203,7 +209,9 @@ class RoutingRecorder(DecodeHooks):
         p4["resident"][step].copy_(resident.to(torch.uint8))
         p4["resident_nonbinary"][step].copy_(((resident != 0) & (resident != 1)).sum().to(torch.int32))
         p4["ema"][step].copy_(shared.ema)
-        p4["age"][step].copy_(shared.age.to(torch.int16))
+        age = shared.age
+        p4["age_out_of_range"][step].copy_(((age < 0) | (age > self.p4_far)).sum().to(torch.int32))
+        p4["age"][step].copy_(age.to(torch.int16))
         p4["routes"][step].copy_(inner.score_inputs["routes"])
         p4["h"][step].copy_(inner.score_inputs["h"][self.p4_layers])
         for name in ("tid", "upcoming_tid"):
@@ -231,6 +239,8 @@ class RoutingRecorder(DecodeHooks):
             D = p4["producer"].shape[-1]
             if hidden.shape != (1, D):
                 raise RuntimeError(f"routing recorder: hidden {tuple(hidden.shape)} at layer {layer_id}, expected (1, {D})")
+            if hidden.dtype not in EXACT_IN_FP32:
+                raise RuntimeError(f"routing recorder: hidden dtype {hidden.dtype} is not exact in FP32")
             if self.p4_producer_dtype not in (None, str(hidden.dtype)):
                 raise RuntimeError(f"routing recorder: hidden dtype {hidden.dtype}, earlier {self.p4_producer_dtype}")
             self.p4_producer_dtype = str(hidden.dtype)
