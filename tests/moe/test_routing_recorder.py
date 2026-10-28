@@ -250,3 +250,119 @@ def test_engine_wraps_hooks_for_recording_and_profiling(tmp_path, monkeypatch, r
     if profile:
         outer = engine._load_decode_hooks(config)
         assert outer.requests == frozenset({2, 11})
+
+
+# -- shared learned eviction (EXP586 step D, P4 audit rows) ------------------------------------------
+
+D = 4
+
+
+class FakeShared(FakeInner):
+    """Shared-mode inner hooks: observe(0) snapshots residency like the real hook and then mutates the
+    cache (as a later ensure would); after_decode overwrites the frozen inputs like the real hook."""
+
+    def __init__(self, cache, far=7, hidden_layers=(1, 2)):
+        super().__init__(with_probs=False)
+        self.cache = cache
+        self.shared = SimpleNamespace(far=far, hidden_layers=torch.tensor(hidden_layers),
+                                      ema=torch.zeros(L, E), age=torch.full((L, E), far, dtype=torch.int64))
+        self.learned = SimpleNamespace(keep=torch.zeros(L, E), valid=torch.zeros(1, dtype=torch.int32),
+                                       start_layer=1, counters=torch.zeros(3, dtype=torch.int64))
+        self.resident = torch.zeros(L, E)
+        self.score_inputs = dict(h=torch.zeros(L, D, dtype=torch.float16), routes=torch.zeros(L, K, dtype=torch.int64))
+        self.raw = dict(tid=torch.zeros(1, dtype=torch.int64), upcoming_tid=torch.zeros(1, dtype=torch.int64),
+                        pos=torch.zeros(1, 1))
+        self.live_h = torch.zeros(L, D, dtype=torch.float16)
+        self.mutations = 0
+
+    def observe(self, layer_id, hidden, router_logits, topk_ids):
+        super().observe(layer_id, hidden, router_logits, topk_ids)
+        if layer_id == 0:
+            self.resident.copy_(self.cache.slot_for_id >= 0)
+            self.cache.slot_for_id[2, 9 + self.mutations] = 1  # a mutation after the snapshot point
+            self.mutations += 1
+        self.live_h[layer_id] = hidden.float().half()[0]
+
+    def after_decode(self, step, consumed, sampled):
+        super().after_decode(step, consumed, sampled)
+        self.score_inputs["h"].copy_(self.live_h)
+        self.score_inputs["routes"].fill_(step + 100)
+        self.raw["tid"].fill_(int(consumed))
+        self.raw["upcoming_tid"].fill_(int(sampled))
+        self.raw["pos"].fill_((step + 1) / 256)
+
+
+def shared_step(rec, inner, step, token):
+    rec.before_decode(step)
+    inner.shared.ema.fill_(0.5 + step)
+    inner.shared.age.fill_(step)
+    for layer in range(L):
+        rec.observe(layer, torch.full((1, D), layer + step + 0.3, dtype=torch.bfloat16), None, ids(layer, layer + 1))
+    rec.after_decode(step, torch.tensor([token]), torch.tensor([token + 1]))
+
+
+def test_shared_mode_exports_p4_rows_with_their_clock(tmp_path):
+    cache = make_cache()
+    inner = FakeShared(cache)
+    rec = RoutingRecorder(inner, tmp_path, top_k=K, capacity=4)
+    rec.bind(None, cache)
+    rec.observe(0, torch.zeros(1, D, dtype=torch.bfloat16), None, ids(9, 9))  # capture: scratch row only
+    rec.begin_request(5)
+    shared_step(rec, inner, 0, 40)
+    shared_step(rec, inner, 1, 41)
+    rec.begin_request(6)
+    record = torch.load(files(tmp_path)[0])
+    assert record["evict_mode"] == "shared" and record["evict_layers"] == list(range(L))
+    assert record["shared_hidden_layers"] == [1, 2] and "evict_source_layers" not in record
+    assert record["p4_schema"] == 1 and record["p4_producer_dtype"] == "torch.bfloat16"
+    # direct: read before the inner observe(0), so step 0's mutation (at [2, 10]; the capture call made
+    # [2, 9]) is missing at step 0 and present at step 1 ...
+    assert record["p4_direct"][:, 2, 9:12].tolist() == [[1, 0, 0], [1, 1, 0]]
+    assert record["p4_direct"][0, 0, 1].item() == 1
+    # ... and it equals the inner hook's own snapshot at both steps
+    assert torch.equal(record["p4_direct"], record["p4_resident"])
+    assert record["p4_resident_nonbinary"].tolist() == [0, 0]
+    # producer: layers 1 and 2 only, exact bf16 values in FP32
+    want = torch.tensor([[1.3, 2.3], [2.3, 3.3]], dtype=torch.bfloat16).float()
+    assert torch.equal(record["p4_producer"][:, :, 0], want)
+    # the frozen inputs this step's scorer read: reset zeros at step 0, step 0's values at step 1
+    assert record["p4_h"][0].abs().sum().item() == 0
+    assert torch.equal(record["p4_h"][1], record["p4_producer"][0].half())
+    assert record["p4_routes"][:, 0, 0].tolist() == [0, 100]
+    assert record["p4_tid"].tolist() == [0, 40] and record["p4_upcoming_tid"].tolist() == [0, 41]
+    assert record["p4_pos"].tolist() == [0.0, 1 / 256]
+    assert record["p4_consumed"].tolist() == [40, 41] and record["p4_sampled"].tolist() == [41, 42]
+    assert record["p4_ema"][:, 0, 0].tolist() == [0.5, 1.5] and record["p4_age"][:, 0, 0].tolist() == [0, 1]
+    assert record["p4_age"].dtype == torch.int16
+    # the next request starts from zero rows
+    assert rec.p4["consumed"].abs().sum().item() == 0 and rec.p4["direct"][:2].sum().item() == 0
+
+
+def test_shared_mode_refuses_bad_hidden_and_age_range(tmp_path):
+    cache = make_cache()
+    with pytest.raises(ValueError, match="int16"):
+        RoutingRecorder(FakeShared(cache, far=40000), tmp_path, top_k=K, capacity=4).bind(None, cache)
+    rec = RoutingRecorder(FakeShared(cache), tmp_path, top_k=K, capacity=4)
+    rec.bind(None, cache)
+    with pytest.raises(RuntimeError, match="hidden"):
+        rec.observe(1, torch.zeros(2, D, dtype=torch.bfloat16), None, ids(1, 2))
+    rec.observe(1, torch.zeros(1, D, dtype=torch.bfloat16), None, ids(1, 2))
+    with pytest.raises(RuntimeError, match="dtype"):
+        rec.observe(2, torch.zeros(1, D, dtype=torch.float16), None, ids(1, 2))
+
+
+def test_rows_mode_export_names_its_rows_and_has_no_p4(tmp_path):
+    cache = make_cache()
+    inner = FakeInner(with_probs=False)
+    inner.learned = SimpleNamespace(keep=torch.zeros(2, E), valid=torch.zeros(1, dtype=torch.int32),
+                                    start_layer=1, counters=torch.zeros(3, dtype=torch.int64))
+    inner.evict = SimpleNamespace(layers=[0, 2], source_layers=[0, 1])
+    rec = RoutingRecorder(inner, tmp_path, top_k=K, capacity=4)
+    rec.bind(None, cache)
+    rec.begin_request(1)
+    decode_step(rec, 0, [(1, 1), (1, 1), (1, 1)])
+    rec.begin_request(2)
+    record = torch.load(files(tmp_path)[0])
+    assert rec.p4 is None and record["evict_mode"] == "rows"
+    assert record["evict_layers"] == [0, 2] and record["evict_source_layers"] == [0, 1]
+    assert not [k for k in record if k.startswith("p4_") or k == "shared_hidden_layers"]

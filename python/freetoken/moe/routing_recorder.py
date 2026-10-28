@@ -6,7 +6,8 @@ addition it records, per decode step and MoE layer, the raw top-k expert ids bef
 first decode step of a request it saves the expert-cache state after prefill (slot map, slot
 reverse map, LRU usage stamps, the cache step clock). With a predictor it also saves the
 predictor's scores of every step, and with learned eviction (EXP526) the keep scores and their
-valid flag of every step. With the prefetch hooks it also saves, after every step, the selected
+valid flag of every step. With shared learned eviction (EXP585/586, R584) it also saves the P4 audit
+rows of every step (see _allocate_p4). With the prefetch hooks it also saves, after every step, the selected
 experts of each section, the pump's per-slot payload and the cumulative pump and demand counters. When the next request begins, it writes one file per finished
 request together with the live per-layer miss counters, which a replay must reproduce exactly.
 
@@ -30,6 +31,7 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 SCHEMA = 1
+P4_SCHEMA = 1
 # scores[r] are the predictor scores the forward of decode step r used: computed at its layer 0
 # from the inputs frozen after step r - 1. Row 0 scores reset (zero) inputs and forecasts nothing.
 SCORE_CLOCK = "scores[r]: used by decode step r, computed from inputs frozen after step r-1; row 0 has reset inputs"
@@ -53,6 +55,7 @@ class RoutingRecorder(DecodeHooks):
         self.steps = 0
         self.overflow = False
         self.sequence = 0  # number of request files written
+        self.p4: dict[str, torch.Tensor] | None = None  # set in bind (_allocate_p4)
 
     # -- lifecycle (main stream, outside the graph) --------------------------------
 
@@ -100,9 +103,44 @@ class RoutingRecorder(DecodeHooks):
             for name, src in (("selections", self.inner.records), ("payload", self.inner.payload),
                               ("pump_stats", self.inner.stats), ("demand_counters", self.inner.demand.counters)):
                 self.prefetch[name] = (src, torch.zeros((C,) + tuple(src.shape), dtype=src.dtype, device=dev))
+        self.p4 = self._allocate_p4(cache, dev)
         after =torch.cuda.memory_allocated(dev) if dev.type == "cuda" else 0
         logger.info("routing recorder: %.2f MiB of buffers allocated after cache sizing (%d slots), output %s",
                     (after - before) / 2**20, S, self.out_dir)
+
+    def _allocate_p4(self, cache, dev) -> dict[str, torch.Tensor] | None:
+        """P4 audit rows of shared learned eviction (EXP586 step D), or None in every other mode.
+
+        Two rows are written inside the decode graph, at the step's row index like ``ids`` (the
+        extra row C is the scratch row):
+          direct    (C+1, L, E) uint8: slot_for_id >= 0 read in observe(0) before the inner hook, so at
+                    the same main-stream point where the inner hook snapshots its resident mask.
+          producer  (C+1, n_h, D) FP32: the hidden argument of observe() at R584's hidden-source
+                    layers. FP32 holds bf16/fp16 values exactly; p4_producer_dtype names the source.
+        The rest is copied in after_decode before the inner after_decode overwrites the frozen
+        inputs, so each row holds what this step's scorer read and the state it left:
+          resident (uint8, plus resident_nonbinary: entries not 0 or 1), ema (FP32), age (int16),
+          routes (score_inputs routes), h (score_inputs h at the hidden-source layers, fp16), tid,
+          upcoming_tid, pos, and the step's consumed and sampled ids.
+        """
+        shared = getattr(self.inner, "shared", None)
+        if shared is None:
+            return None
+        L, E, C, K = cache.num_layers, cache.num_experts, self.capacity, self.top_k
+        far = int(shared.far)
+        if not 0 <= far <= torch.iinfo(torch.int16).max:
+            raise ValueError(f"routing recorder: R584 age index range 0..{far} does not fit int16")
+        self.p4_layers = [int(v) for v in shared.hidden_layers.tolist()]
+        self.p4_producer_dtype = None
+        D = self.inner.score_inputs["h"].shape[1]
+        n_h = len(self.p4_layers)
+        z = lambda *shape, dtype: torch.zeros(shape, dtype=dtype, device=dev)  # noqa: E731
+        return dict(direct=z(C + 1, L, E, dtype=torch.uint8), producer=z(C + 1, n_h, D, dtype=torch.float32),
+                    resident=z(C, L, E, dtype=torch.uint8), resident_nonbinary=z(C, dtype=torch.int32),
+                    ema=z(C, L, E, dtype=torch.float32), age=z(C, L, E, dtype=torch.int16),
+                    routes=z(C, L, K, dtype=torch.int64), h=z(C, n_h, D, dtype=torch.float16),
+                    tid=z(C, dtype=torch.int64), upcoming_tid=z(C, dtype=torch.int64), pos=z(C, dtype=torch.float32),
+                    consumed=z(C, dtype=torch.int64), sampled=z(C, dtype=torch.int64))
 
     def begin_request(self, uid: int) -> None:
         if uid != self.uid:
@@ -117,6 +155,8 @@ class RoutingRecorder(DecodeHooks):
                 self.keep.zero_()
                 self.keep_valid.zero_()
             for _, rows in self.prefetch.values():
+                rows.zero_()
+            for rows in (self.p4 or {}).values():
                 rows.zero_()
         self.row.fill_(self.capacity)
         self.inner.begin_request(uid)
@@ -148,18 +188,54 @@ class RoutingRecorder(DecodeHooks):
             # request: a replay takes differences of consecutive rows.
             for src, rows in self.prefetch.values():
                 rows[step].copy_(src)
+        if self.p4 is not None and step < self.capacity:
+            self._record_p4(step, consumed, sampled)
         self.inner.after_decode(step, consumed, sampled)
         self.steps = step + 1
         # Only observes between before_decode and after_decode write a real row; any other
         # observe (a stray capture or warmup forward) goes to the scratch row.
         self.row.fill_(self.capacity)
 
+    def _record_p4(self, step: int, consumed: torch.Tensor, sampled: torch.Tensor) -> None:
+        """The scorer's inputs and state of this step, before inner.after_decode freezes the next ones."""
+        inner, p4, shared = self.inner, self.p4, self.inner.shared
+        resident = inner.resident
+        p4["resident"][step].copy_(resident.to(torch.uint8))
+        p4["resident_nonbinary"][step].copy_(((resident != 0) & (resident != 1)).sum().to(torch.int32))
+        p4["ema"][step].copy_(shared.ema)
+        p4["age"][step].copy_(shared.age.to(torch.int16))
+        p4["routes"][step].copy_(inner.score_inputs["routes"])
+        p4["h"][step].copy_(inner.score_inputs["h"][self.p4_layers])
+        for name in ("tid", "upcoming_tid"):
+            p4[name][step].copy_(inner.raw[name][0])
+        p4["pos"][step].copy_(inner.raw["pos"][0, 0])
+        p4["consumed"][step].copy_(consumed.reshape(-1)[0].to(torch.int64))
+        p4["sampled"][step].copy_(sampled.reshape(-1)[0].to(torch.int64))
+
     # -- inside the decode graph ---------------------------------------------------
 
     def observe(self, layer_id: int, hidden: torch.Tensor, router_logits: torch.Tensor | None,
                 topk_ids: torch.Tensor) -> None:
         self.record(layer_id, topk_ids)
+        if self.p4 is not None:
+            self._observe_p4(layer_id, hidden)
         self.inner.observe(layer_id, hidden, router_logits, topk_ids)
+
+    def _observe_p4(self, layer_id: int, hidden: torch.Tensor) -> None:
+        """In-graph P4 rows; runs before the inner observe (see _allocate_p4)."""
+        p4 = self.p4
+        if layer_id == 0:
+            direct = (self.cache.slot_for_id >= 0).to(torch.uint8)
+            p4["direct"].index_copy_(0, self.row, direct.unsqueeze(0))
+        if layer_id in self.p4_layers:
+            D = p4["producer"].shape[-1]
+            if hidden.shape != (1, D):
+                raise RuntimeError(f"routing recorder: hidden {tuple(hidden.shape)} at layer {layer_id}, expected (1, {D})")
+            if self.p4_producer_dtype not in (None, str(hidden.dtype)):
+                raise RuntimeError(f"routing recorder: hidden dtype {hidden.dtype}, earlier {self.p4_producer_dtype}")
+            self.p4_producer_dtype = str(hidden.dtype)
+            j = self.p4_layers.index(layer_id)
+            p4["producer"][:, j].index_copy_(0, self.row, hidden.float())
 
     def record(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Store this layer's raw ids and their residency in the current row (device ops only)."""
@@ -206,9 +282,15 @@ class RoutingRecorder(DecodeHooks):
         if self.keep is not None:
             learned = self.inner.learned
             record.update(keep=self.keep[:n].cpu(), keep_valid=self.keep_valid[:n].cpu(),
-                          evict_layers=list(self.inner.evict.layers), evict_source_layers=list(self.inner.evict.source_layers),
-                          evict_start_layer=learned.start_layer,
-                          evict_counters=learned.counters.cpu())
+                          evict_start_layer=learned.start_layer, evict_counters=learned.counters.cpu())
+            if self.p4 is None:  # EvictRows (EXP526): its rows and their source layers
+                record.update(evict_mode="rows", evict_layers=list(self.inner.evict.layers),
+                              evict_source_layers=list(self.inner.evict.source_layers))
+            else:  # shared R584 scores every layer; its hidden features come from p4_layers
+                record.update(evict_mode="shared", evict_layers=list(range(cache.num_layers)),
+                              shared_hidden_layers=list(self.p4_layers), p4_schema=P4_SCHEMA,
+                              p4_producer_dtype=self.p4_producer_dtype,
+                              **{"p4_" + name: rows[:n].cpu() for name, rows in self.p4.items()})
         if self.prefetch:
             # pump_stats columns: commitmoe_prefetch.kernels.STATS_FIELDS; demand_counters columns:
             # stage misses, host misses, host misses while pending (as live_counters).
