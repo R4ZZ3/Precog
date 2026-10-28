@@ -9,7 +9,11 @@ C0  Components on the EXP585 fixtures (the P0 checks, adapted to the fast call s
     path's input of that stage: every pre-activation is within the unchanged P0 tolerance of
     reference_linear (exp585_window_checks.qgemv_ratio <= 1); each GELU epilogue output is within one
     BF16 spacing of F.gelu of the same pre-activation; both wbx slices are within the P0 tolerance of the
-    original wb and wb64 stages. Bit equality with qbank.qlinear is reported, not gated.
+    original wb and wb64 stages. Bit equality with qbank.qlinear is reported, not gated. The fast trunk's
+    own assembly is checked too: its fc1 input must equal the bytes that the original heads code builds
+    from the fast w_layer and h_proj outputs, and each later stage must read the previous fast output.
+    The criteria are recorded, reported, then asserted by one pytest.fail(C0_REJECT ...), the only C0
+    failure that step B treats as a numerical rejection of the variant.
 C1  qgemv2 shapes outside the bundle's: N not a multiple of BLOCK_N, K not a multiple of GROUP, groups not
     divisible by the split count, bias and GELU on and off, head stride 0. The split-K scratch is filled
     with NaN before each launch, so an unwritten partial fails the finite check.
@@ -21,6 +25,8 @@ C2  readout + publish against the ORIGINAL torch code (SharedEvict.heads tail an
     + 2 max_j tol_u_j, because logsigmoid and logsumexp pass an input error at most once each to pos
     and neg. The finite masks of z must be equal, the non-finite count must equal the reference count,
     and publish must give valid 0 and count the token exactly when a scored token has a non-finite z.
+C3  state_own against SharedEvict.advance + own on seeded edge states (zero, subnormal and near-2^-126
+    ema, ages near far, duplicate route ids, step 0 after a nonzero state, reset and replay): bit for bit.
 P1F Graph against eager with the fast hooks (one-pass and split, J = 1), as P1: residency, keep, valid,
     state, probabilities and the victim decisions, plus the prior advanced exactly once per token.
     Memory: the reserve, the scorer's buffers, the split-K scratch and the capture are reported.
@@ -33,7 +39,9 @@ F1  Asynchronous lifetime (Codex c22e40f9): replay -> after_decode -> next token
     mode. A mutation that removes main's join of the probe stream must change the eager result.
 B2  Component timings (step B): original against fast stages as captured graphs, cold L2, blocks
     original/fast/fast/original (F8 stages: original/i/ii/ii/i/original), 20 warm-ups and 200 timed
-    replays per block. Every output must be finite; times are reported for the F8 choice of the runner.
+    replays per block, on the first valid fixture event (not a2's token). Every output must be finite.
+    Each block's median/p90/max and the pooled statistics per arm are reported; the runner's F8 rule
+    reads the pooled 'scorer' medians.
 a2  The EXP585 gate, unchanged (the same graph and statistic: test_gpu_shared_evict._prefix_graph and
     _block, blocks base/cand/cand/base, 150 us on the candidate median), with the fast arm as candidate.
     Before the assertion, a separate stamped diagnostic graph reports scores-ready, probs written and the
@@ -115,18 +123,57 @@ def _gelu_ratio(post: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
 
 # --- C0: components on the fixtures ---------------------------------------------------------------------
 
+C0_REJECT = 'C0 numerical rejection: '  # exp586_gpu_window.C0_REJECT; the runner binds the two
+C0_CRITERIA = ('state_exact', 'x_exact', 'assembly_exact', 'stage_ratio_le_1', 'gelu_spacings_le_1')
+
+
+def _recording(s, log: list):
+    """Make s.matvec append (name, x, y) for every call (FastSharedEvict.trunk calls self.matvec)."""
+    real = type(s).matvec
+
+    def matvec(x, name, gelu=False, shared_row=False):
+        y = real(s, x, name, gelu=gelu, shared_row=shared_row)
+        log.append((name, x, y))
+        return y
+    s.matvec = matvec
+
+
+def _assembled_fc1_input(orig, own, args, table, z, hp) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(w_layer input, h_proj input, fc1 input) that the ORIGINAL SharedEvict.heads code builds when its
+    w_layer and h_proj outputs are ``z`` and ``hp`` (the fast trunk's own outputs). The later stages
+    return zeros: only the assembly before fc1 is read."""
+    seen = []
+    given = iter([z, hp])
+
+    def lin(x, codes, scale, bias, group):
+        seen.append(x)
+        y = next(given, None)
+        return torch.zeros(codes.shape[0], codes.shape[1], dtype=BF, device=CUDA) if y is None else y
+    twin = copy.copy(orig)
+    twin.linear = lin
+    twin.heads(own, *args, table)
+    return seen[0], seen[1], seen[2]
+
+
 @pytest.mark.parametrize('variant', VARIANTS)
 def test_c0_components(variant):
+    """The declared criteria (C0_CRITERIA) are recorded over all events, written to the report, and only
+    then asserted with one pytest.fail(C0_REJECT ...): that is the only failure the step B runner accepts
+    as a numerical rejection of the variant. Every other failure (a structural assert, a non-finite
+    stage output in _ratio, a CUDA or compile error) raises before the report row and ends the attempt."""
     fx = _fixtures()
     calls: list = []
     orig, fast, table = _scorers(calls)
     s = fast[variant]
+    fast_calls: list = []
+    _recording(s, fast_calls)
     trunk = ('w_layer', 'h_proj', 'fc1', 'fc2', 'we')
     worst = dict.fromkeys(trunk + ('wb', 'wb64'), 0.0)
     gelu_worst = dict.fromkeys(('fc1', 'fc2', 'we'), 0.0)
     exact = dict.fromkeys(worst, 0)
     gelu_exact = dict.fromkeys(gelu_worst, 0)
     total = dict.fromkeys(worst, 0)
+    bad = dict(state=[], x=[], assembly=[])
     events = scored = 0
     for e in fx['events']:
         if e['kind'] == 'reset':
@@ -140,15 +187,31 @@ def test_c0_components(variant):
         orig.advance(routes, step)
         x = s.advance_and_own(routes, step, res)
         events += 1
-        assert torch.equal(s.ema.cpu(), e['expect']['ema']) and torch.equal(s.age.cpu(), e['expect']['age'].long())
-        assert torch.equal(s.routed, orig.routed), events
+        if not (torch.equal(s.ema.cpu(), e['expect']['ema']) and torch.equal(s.age.cpu(), e['expect']['age'].long())
+                and torch.equal(s.routed, orig.routed)):
+            bad['state'].append(events)
         own = orig.own(res)
-        assert torch.equal(x, _x_of(own)), events
+        if not torch.equal(x, _x_of(own)):
+            bad['x'].append(events)
         if not e['expect']['valid']:
             continue
         scored += 1
+        args = _args(x_in, fx['meta']['hidden_layers'], CUDA)
+        # The fast trunk's own feature assembly (Codex 8b620dc5 item 4): its fc1 input must be the bytes
+        # the original code assembles from the same w_layer and h_proj outputs, and each later stage must
+        # read the previous fast stage's output.
+        fast_calls.clear()
+        s.trunk(x, *args, table)
+        assert [n for n, _, _ in fast_calls] == ['w_layer', 'h_proj', 'fc1', 'fc2', 'we', 'wbx'], fast_calls
+        f = {n: (xi, y) for n, xi, y in fast_calls}
+        wl_in, hp_in, fc1_in = _assembled_fc1_input(orig, own, args, table, f['w_layer'][1], f['h_proj'][1])
+        if not (torch.equal(f['w_layer'][0], wl_in) and torch.equal(f['h_proj'][0], hp_in)
+                and torch.equal(f['fc1'][0], fc1_in) and torch.equal(f['fc2'][0], f['fc1'][1])
+                and torch.equal(f['we'][0], f['fc2'][1]) and torch.equal(f['wbx'][0], f['we'][1])):
+            bad['assembly'].append(events)
+        # Each stage on the ORIGINAL path's input of that stage: the arithmetic alone.
         calls.clear()
-        orig.heads(own, *_args(x_in, fx['meta']['hidden_layers'], CUDA), table)
+        orig.heads(own, *args, table)
         for i, name in enumerate(trunk):
             xin, codes, scale, bias, group, y_orig = calls[i]
             shared = name == 'we'
@@ -174,12 +237,17 @@ def test_c0_components(variant):
             worst[name] = max(worst[name], float(_ratio(part.contiguous(), xin, codes, scale, bias, group).max()))
             exact[name] += int((part == y_orig).sum())
             total[name] += part.numel()
-    _report('c0', variant=variant, events=events, scored=scored, worst_ratio=worst, gelu_worst_spacings=gelu_worst,
+    assert scored == sum(e['expect']['valid'] for e in fx['events']) > 0 and events == len(fx['events'])
+    criteria = dict(state_exact=not bad['state'], x_exact=not bad['x'], assembly_exact=not bad['assembly'],
+                    stage_ratio_le_1=max(worst.values()) <= 1.0, gelu_spacings_le_1=max(gelu_worst.values()) <= 1.0)
+    assert tuple(criteria) == C0_CRITERIA
+    failed = [k for k, ok in criteria.items() if not ok]
+    _report('c0', variant=variant, completed=True, criteria=criteria, failed=failed, events=events, scored=scored,
+            bad_events={k: v[:20] for k, v in bad.items()}, worst_ratio=worst, gelu_worst_spacings=gelu_worst,
             exact_share_vs_qlinear={n: exact[n] / max(total[n], 1) for n in total},
             gelu_exact_share={n: gelu_exact[n] / max(total[n], 1) for n in gelu_exact})
-    assert scored == sum(e['expect']['valid'] for e in fx['events']) > 0 and events == len(fx['events'])
-    assert max(worst.values()) <= 1.0, worst
-    assert max(gelu_worst.values()) <= 1.0, gelu_worst
+    if failed:
+        pytest.fail(C0_REJECT + ','.join(failed), pytrace=False)
 
 
 # --- C1: qgemv2 shapes ------------------------------------------------------------------------------------
@@ -362,6 +430,90 @@ def test_c2_readout_and_publish():
         assert r['bad_count'] == r['z_nonfinite_ref'], r
     assert [r for r in rows if r['case'] == 'nonfinite'][0]['z_nonfinite_ref'] > 0
     assert [(p['valid'], p['nonfinite'], p['bad_after']) for p in pub] == [(0, 5, 0), (1, 5, 0), (0, 5, 0), (0, 6, 0)]
+
+
+# --- C3: the fused state kernel on seeded states -----------------------------------------------------------
+
+TINY = 2.0 ** -126  # the smallest normal FP32; below it a flush-to-zero build would differ from torch
+# 1e-30 * 0.9^n passes 2^-126 at n = 174 and is 13 subnormal units at n = 300 (FP32, measured on the CPU).
+# It never reaches 0: 0.9 k rounds back to k for k <= 4. A flush-to-zero build would give 0 instead.
+DECAY_TOKENS = 300
+
+
+def _seeded_state(far: int, gen: torch.Generator) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(ema, age, routed) on the CPU with the edge values of each field mixed over (L, E)."""
+    pool = torch.tensor([0.0, 2.0 ** -149, 1e-40, 2.0 ** -127, TINY - 2.0 ** -149, TINY, TINY * (1 + 2.0 ** -23),
+                         1e-30, 0.5, 1.0])
+    ema = torch.where(torch.rand(L, E, generator=gen) < 0.7, pool[torch.randint(0, len(pool), (L, E), generator=gen)],
+                      torch.rand(L, E, generator=gen))
+    ages = torch.tensor([0, 1, far - 2, far - 1, far])
+    age = torch.where(torch.rand(L, E, generator=gen) < 0.7, ages[torch.randint(0, len(ages), (L, E), generator=gen)],
+                      torch.randint(0, far + 1, (L, E), generator=gen))
+    return ema, age.long(), (torch.rand(L, E, generator=gen) < 0.1).float()
+
+
+def _routes(gen: torch.Generator, fixed: bool = False) -> torch.Tensor:
+    """(L, K) int64 route ids; every third layer repeats ids (the kernel and scatter_ must both give 1)."""
+    r = torch.arange(K).repeat(L, 1) if fixed else torch.stack([torch.randperm(E, generator=gen)[:K] for _ in range(L)])
+    r[::3, K // 2:] = r[::3, :K // 2]
+    return r.long()
+
+
+def test_c3_state_own():
+    """state_own against SharedEvict.advance + own (Codex 8b620dc5 item 2): FP32 ema and routed, int64 age
+    and the BF16 own features bit for bit, after every token of a seeded sequence (steps with 0 after a
+    nonzero state), a 300-token decay through the subnormal range, then reset and a replay that must
+    repeat the first run bit for bit."""
+    orig, fast, _ = _scorers()
+    s = fast['blockn']  # state_own does not depend on the F8 variant
+    gen = torch.Generator().manual_seed(31)
+    seed = _seeded_state(s.far, gen)
+    seq = [(st, _routes(gen), (torch.rand(L, E, generator=gen) < 0.5).float()) for st in (3, 0, 5, 1, 0, 2)]
+    decay = [(1, _routes(gen, fixed=True), torch.zeros(L, E))] * DECAY_TOKENS
+    stats = dict(tokens=0, mismatches=[], subnormal_ref=0, normal_to_subnormal=0, duplicate_layers=len(range(0, L, 3)))
+
+    def load(m, state):
+        for t, v in zip((m.ema, m.age, m.routed), state):
+            t.copy_(v.to(CUDA))
+
+    def run(tokens, tag) -> list[tuple[torch.Tensor, ...]]:
+        outs = []
+        for i, (st, routes, res) in enumerate(tokens):
+            step = torch.tensor([st], dtype=torch.int32, device=CUDA)
+            routes, res = routes.to(CUDA), res.to(CUDA)
+            prev = orig.ema.clone()
+            orig.advance(routes, step)
+            x_ref = _x_of(orig.own(res))
+            x = s.advance_and_own(routes, step, res)
+            stats['tokens'] += 1
+            if not (torch.equal(s.ema, orig.ema) and torch.equal(s.age, orig.age) and torch.equal(s.routed, orig.routed)
+                    and torch.equal(x, x_ref)):
+                stats['mismatches'].append((tag, i))
+            sub = (orig.ema > 0) & (orig.ema < TINY)
+            stats['subnormal_ref'] += int(sub.sum())
+            stats['normal_to_subnormal'] += int(((prev >= TINY) & sub).sum())
+            if st == 0:
+                assert torch.equal(orig.ema, prev), (tag, i)  # the reference itself keeps the state at step 0
+            outs.append((s.ema.clone(), s.age.clone(), s.routed.clone(), x.clone()))
+        return outs
+
+    load(orig, seed)
+    load(s, seed)
+    first = run(seq, 'seq')
+    run(decay, 'decay')
+    orig.reset()
+    s.reset()
+    reset_ok = (not s.ema.any() and bool(s.age.eq(s.far).all()) and not s.routed.any() and int(s.bad) == 0
+                and torch.equal(s.ema, orig.ema) and torch.equal(s.age, orig.age))
+    load(orig, seed)
+    load(s, seed)
+    again = run(seq, 'replay')
+    replay_same = all(torch.equal(a, b) for fa, fb in zip(first, again, strict=True) for a, b in zip(fa, fb))
+    _report('c3', **{k: v[:20] if isinstance(v, list) else v for k, v in stats.items()}, reset_ok=reset_ok,
+            replay_same=replay_same)
+    assert not stats['mismatches'], stats['mismatches'][:20]
+    assert reset_ok and replay_same
+    assert stats['subnormal_ref'] > 0 and stats['normal_to_subnormal'] > 0, stats  # the edge was reached
 
 
 # --- P1F: graph against eager with the fast hooks ---------------------------------------------------------
@@ -687,8 +839,18 @@ def _stage_block(graph, stamps, flush, outputs) -> list[int]:
     return out
 
 
+def _stats(v: list[int]) -> dict:
+    t = torch.tensor(v, dtype=torch.float64)
+    return dict(median_us=float(t.median()) / 1e3, p90_us=float(torch.quantile(t, 0.9)) / 1e3,
+                max_us=float(t.max()) / 1e3, replays=len(v))
+
+
 def test_b2_component_bench():
-    """Original against fast stages, cold L2. Reported only; the runner applies the F8 rule."""
+    """Original against fast stages, cold L2. Reported only; the runner applies the F8 rule to the pooled
+    'scorer' medians. Setup (a prospective change from plan revision 0, which named a2's inputs): every
+    stage runs on the first valid fixture event with step 1, the same routes on every replay; the 'state'
+    and 'scorer' arms advance their own state on each replay. These times compare implementations of
+    the same work; they are not a2 and establish nothing about the 150 us gate."""
     from commitmoe_prefetch.qbank import qlinear
     fx = _fixtures()
     calls: list = []
@@ -754,20 +916,23 @@ def test_b2_component_bench():
                        ii=lambda: fast['splitk'].score(routes, step, res, *args, table, keep, valid, nonfinite)),
     }
     flush = torch.empty(FLUSH_BYTES, dtype=torch.uint8, device=CUDA)
-    results = {}
+    results, blocks = {}, {}
     for name, arms in stages.items():
         stamps = torch.zeros(2, dtype=torch.int64, device=CUDA)
         graphs = {arm: _stage_graph(body, stamps) for arm, body in arms.items()}
         names = list(arms)
         times = {arm: [] for arm in names}
-        for arm in names + names[::-1]:  # original/fast/fast/original or original/i/ii/ii/i/original
+        blocks[name] = []
+        for order, arm in enumerate(names + names[::-1]):  # original/fast/fast/original or original/i/ii/ii/i/original
             graph, outputs = graphs[arm]
-            times[arm] += _stage_block(graph, stamps, flush, outputs + [keep])
-        results[name] = {arm: dict(median_us=float(torch.tensor(v, dtype=torch.float64).median()) / 1e3,
-                                   p90_us=float(torch.quantile(torch.tensor(v, dtype=torch.float64), 0.9)) / 1e3,
-                                   replays=len(v)) for arm, v in times.items()}
+            v = _stage_block(graph, stamps, flush, outputs + [keep])
+            times[arm] += v
+            blocks[name].append(dict(order=order, arm=arm, **_stats(v)))
+        results[name] = {arm: _stats(v) for arm, v in times.items()}  # pooled over the arm's blocks
         del graphs
-    _report('b2', stages=results, nonfinite_tokens=int(nonfinite))
+    _report('b2', stages=results, blocks=blocks, nonfinite_tokens=int(nonfinite),
+            setup='first valid fixture event, step 1, the same routes each replay (scorer arms advance their '
+                  'state every replay); not the a2 START token, so no a2 or 150 us conclusion')
     assert int(nonfinite) == 0
     assert all(r['replays'] == 2 * TIMED for arms in results.values() for r in arms.values())
 
