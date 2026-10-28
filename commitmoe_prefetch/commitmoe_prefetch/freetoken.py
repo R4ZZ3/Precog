@@ -98,6 +98,9 @@ EVICT_ENV, EVICT_START_ENV = 'FREETOKEN_LEARNED_EVICT', 'FREETOKEN_LEARNED_EVICT
 # hold main's arrival at every observe(L), to screen candidate J values in one run (those 40 extra
 # kernels slow main down: confirm the chosen J with the plain timing). The rows of all tokens so
 # far are written when the next request begins, so the last request of a run is not written.
+# The same file holds 'join' (EXP586), two columns per token: main right before (0) and right
+# after (1) its wait for the probe stream at the last layer. A separate tensor, so that the
+# column layout above stays the one that the EXP526/EXP585 checks read.
 EVICT_TIMING_ENV, EVICT_TIMING_ALL_ENV = 'FREETOKEN_LEARNED_EVICT_TIMING', 'FREETOKEN_LEARNED_EVICT_TIMING_ALL'
 # Shared learned eviction switch (EXP585): an exp585_export.py bundle path. It uses EVICT_START_ENV for J.
 SHARED_EVICT_ENV = 'FREETOKEN_SHARED_EVICT'
@@ -157,6 +160,7 @@ class PrefetchHooks(DecodeHooks):
         self.release_sha256 = release_sha256
         self.stamp_rows: list[torch.Tensor] = []
         self.stamp_steps: list[int] = []
+        self.join_rows: list[torch.Tensor] = []
         self.learned: LearnedEvict | None = None
         self.shared_cfg, self.shared_fast = shared, shared_fast
         self.shared: SharedEvict | None = None
@@ -218,6 +222,7 @@ class PrefetchHooks(DecodeHooks):
                                         counters=torch.zeros(len(EVICT_COUNTERS), dtype=torch.int64, device=dev))
             self.scores_ready = torch.cuda.Event()
             self.stamps = torch.zeros(L + 3, dtype=torch.int64, device=dev)
+            self.join_stamps = torch.zeros(2, dtype=torch.int64, device=dev)
             # Tokens whose keep scores were not all finite (published with valid = 0, so LRU).
             self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
             logger.info('learned eviction: layers %s (source heads %s) from layer %d, rows %.1f MiB (%s)',
@@ -241,6 +246,7 @@ class PrefetchHooks(DecodeHooks):
                                         counters=torch.zeros(len(EVICT_COUNTERS), dtype=torch.int64, device=dev))
             self.scores_ready = torch.cuda.Event()
             self.stamps = torch.zeros(L + 3, dtype=torch.int64, device=dev)
+            self.join_stamps = torch.zeros(2, dtype=torch.int64, device=dev)
             self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
             logger.info('shared learned eviction: all %d layers from layer %d, R584 %.1f MiB (%s), fast %s',
                         L, start, self.shared.nbytes / 2**20, path, self.shared_fast)
@@ -285,7 +291,8 @@ class PrefetchHooks(DecodeHooks):
             logger.info('expert predictor: request %s, misses per layer: %s', self.uid, per_layer)
             if self.timing is not None and self.stamp_rows:
                 torch.save(dict(stamps=torch.stack(self.stamp_rows).cpu(), step=torch.tensor(self.stamp_steps),
-                                start_layer=self.learned.start_layer), self.timing)
+                                join=torch.stack(self.join_rows).cpu(), start_layer=self.learned.start_layer),
+                           self.timing)
         self.uid, self.steps = uid, 0
         # The previous token's graph joined its probe and demand streams into main, so these
         # writes on main are ordered after all of its prefetch work.
@@ -342,6 +349,7 @@ class PrefetchHooks(DecodeHooks):
         self.steps = step + 1
         if self.timing is not None:
             self.stamp_rows.append(self.stamps.clone())
+            self.join_rows.append(self.join_stamps.clone())
             self.stamp_steps.append(step)
 
     # -- inside the decode graph ---------------------------------------------------
@@ -532,7 +540,11 @@ class PrefetchHooks(DecodeHooks):
                     SECTION_LAYERS=sl, STRIPES=kernels.PUMP_STRIPES, CHUNK_BYTES=kernels.CHUNK_BYTES,
                     num_warps=8)
         if layer_id == self.cfg.base_model.num_layers - 1:
+            if self.timing is not None:
+                kernels.stamp[(1,)](self.join_stamps, IDX=0)
             main.wait_stream(probe)
+            if self.timing is not None:
+                kernels.stamp[(1,)](self.join_stamps, IDX=1)
 
     # -- reporting -----------------------------------------------------------------
 
