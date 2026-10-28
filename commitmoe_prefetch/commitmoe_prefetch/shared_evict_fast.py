@@ -3,8 +3,9 @@
 Same bundle, state, features and arithmetic contract as SharedEvict; only the launch structure differs:
   F4   advance_and_own: one fast_kernels.state_own launch advances the state and writes the BF16 own
        features in the w_layer input layout (SharedEvict: advance, own, permute and cast).
-  F6   the GELU after fc1, fc2 and we runs in the qgemv epilogue, and we reads the single trunk row with
-       head stride 0 instead of an expanded copy.
+  F6   we reads the single trunk row with head stride 0 instead of an expanded copy. The GELU after fc1,
+       fc2 and we is torch's F.gelu on the BF16 matvec output, as in SharedEvict (a fused GELU failed
+       EXP586 step B; see fast_kernels).
   F8   fc1 and h_proj get more programs: 'blockn' (BLOCK_N 8, the qgemv k-loop order kept) or 'splitk'
        (K groups split, FP32 partials added in split order, bias and BF16 rounding once).
   F3b  wb and wb64 run as one qgemv launch on codes, scales and biases concatenated along N at load.
@@ -41,6 +42,32 @@ def split_groups(groups: int, splits: int) -> int:
     if splits < 2 or (splits - 1) * per >= groups:
         raise ValueError(f'{groups} K groups cannot be split {splits} ways with a group in every split')
     return per
+
+
+def fast_linear(x: torch.Tensor, codes: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None, group: int,
+                block_n: int = BLOCK_N, partial: torch.Tensor | None = None, shared_row: bool = False,
+                gelu: bool = False) -> torch.Tensor:
+    """(H, N) BF16 = [F.gelu](qgemv2) on the GPU. partial (S, H, N) FP32, S >= 2: the K groups split S ways
+    into it, then splitk_reduce (bias and BF16 rounding once). shared_row: x is one (1, K) row read by
+    every head (head stride 0). GELU is torch's F.gelu of the BF16 output, the original operation."""
+    H, N, K = codes.shape
+    assert x.shape == ((1, K) if shared_row else (H, K)) and x.is_contiguous(), tuple(x.shape)
+    y = torch.empty(H, N, dtype=torch.bfloat16, device=x.device)
+    KG, stride, b = scale.shape[2], 0 if shared_row else K, bias if bias is not None else y
+    if partial is not None:
+        splits = partial.shape[0]
+        assert partial.shape == (splits, H, N) and partial.dtype == torch.float32, tuple(partial.shape)
+        fk.qgemv2[(H, triton.cdiv(N, block_n), splits)](
+            x, codes, scale, y, y, partial, N, K, KG, stride, split_groups(KG, splits), HAS_BIAS=False,
+            SPLIT=splits, GROUP=group, BLOCK_N=block_n, num_warps=4, **NO_FTZ)
+        fk.splitk_reduce[(triton.cdiv(H * N, REDUCE_BLOCK),)](
+            partial, b, y, H * N, HAS_BIAS=bias is not None, SPLIT=splits, BLOCK=REDUCE_BLOCK, num_warps=4,
+            **NO_FTZ)
+    else:
+        fk.qgemv2[(H, triton.cdiv(N, block_n), 1)](
+            x, codes, scale, b, y, y, N, K, KG, stride, KG, HAS_BIAS=bias is not None, SPLIT=1, GROUP=group,
+            BLOCK_N=block_n, num_warps=4, **NO_FTZ)
+    return F.gelu(y) if gelu else y
 
 
 class FastSharedEvict(SharedEvict):
@@ -102,30 +129,15 @@ class FastSharedEvict(SharedEvict):
         return self.x
 
     def matvec(self, x: torch.Tensor, name: str, gelu: bool = False, shared_row: bool = False) -> torch.Tensor:
-        """(H, N) BF16 = [gelu](qgemv of ``name``). shared_row: x is one (1, K) row read by every head."""
+        """(H, N) BF16 = [F.gelu](qgemv of ``name``). shared_row: x is one (1, K) row read by every head."""
         t = self.t
         codes, scale, bias = t[name + '_q'], t[name + '_s'], t.get(name + '_b')
-        H, N, K = codes.shape
+        H = codes.shape[0]
         if not self.kernels:
             y = reference_linear(x.expand(H, -1).contiguous() if shared_row else x, codes, scale, bias, self.group)
             return F.gelu(y) if gelu else y
-        assert x.shape == ((1, K) if shared_row else (H, K)) and x.is_contiguous(), (name, tuple(x.shape))
-        y = torch.empty(H, N, dtype=torch.bfloat16, device=x.device)
-        KG, stride, b = scale.shape[2], 0 if shared_row else K, bias if bias is not None else y
-        if name in self.partial:
-            P, splits = self.partial[name], F8_SPLITS[name]
-            fk.qgemv2[(H, triton.cdiv(N, BLOCK_N), splits)](
-                x, codes, scale, y, y, P, N, K, KG, stride, split_groups(KG, splits), HAS_BIAS=False, GELU=False,
-                SPLIT=splits, GROUP=self.group, BLOCK_N=BLOCK_N, num_warps=4, **NO_FTZ)
-            fk.splitk_reduce[(triton.cdiv(H * N, REDUCE_BLOCK),)](
-                P, b, y, H * N, HAS_BIAS=bias is not None, GELU=gelu, SPLIT=splits, BLOCK=REDUCE_BLOCK,
-                num_warps=4, **NO_FTZ)
-            return y
         block_n = F8_BLOCK_N.get(name, BLOCK_N) if self.f8 == 'blockn' else BLOCK_N
-        fk.qgemv2[(H, triton.cdiv(N, block_n), 1)](
-            x, codes, scale, b, y, y, N, K, KG, stride, KG, HAS_BIAS=bias is not None, GELU=gelu, SPLIT=1,
-            GROUP=self.group, BLOCK_N=block_n, num_warps=4, **NO_FTZ)
-        return y
+        return fast_linear(x, codes, scale, bias, self.group, block_n, self.partial.get(name), shared_row, gelu)
 
     def trunk(self, x: torch.Tensor, h: torch.Tensor, tid: torch.Tensor, upcoming: torch.Tensor,
               pos: torch.Tensor, table: torch.Tensor) -> torch.Tensor:

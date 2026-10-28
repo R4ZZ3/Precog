@@ -2,8 +2,11 @@
 with fewer launches; shared_evict_fast.FastSharedEvict calls them. The original kernels stay unchanged.
 
 Rounding rule: where the original runs one torch op per step, these kernels round each step the same way.
-Products and sums use libdevice mul_rn/add_rn, which the compiler cannot contract into an FMA. exp, log,
-log1p and erf are the libdevice functions (the accurate CUDA math functions), not the fast tl.exp/tl.log.
+Products and sums use libdevice mul_rn/add_rn, which the compiler cannot contract into an FMA. exp, log and
+log1p are the libdevice functions (the accurate CUDA math functions), not the fast tl.exp/tl.log.
+GELU is not fused: FastSharedEvict runs torch's F.gelu on the BF16 matvec output, the original operation.
+A fused libdevice-erf GELU failed EXP586 step B (attempt 20261028T120500, C1 case 2: 171 BF16 spacings from
+F.gelu); near x = -5.3, 1 + erf(x / sqrt 2) is one FP32 unit, so one unit of erf difference is the whole value.
 Equality with the torch kernels is a GPU test target (tests/test_gpu_exp586_fast.py), not a claim: the
 torch reduction order of logsumexp's sum over 4 values, for example, is not documented.
 Denormals: Triton links libdevice with flush-to-zero by default (enable_reflect_ftz), so mul_rn would
@@ -13,9 +16,9 @@ must pass enable_reflect_ftz=False (shared_evict_fast.NO_FTZ).
 Kernels:
   state_own   F4: advance the eviction state of one layer (ema, age, routed; only when step > 0) and write
               the BF16 own features x = [routed, ema, agef, resident] in the w_layer input layout.
-  qgemv2      F8/F6: qbank.qgemv with a head stride for X (0 = one input row shared by all heads), an
-              optional GELU epilogue on the BF16 output, and an optional split of the K groups (FP32
-              partials; splitk_reduce adds them in split order, adds the bias once and rounds once).
+  qgemv2      F8/F6: qbank.qgemv with a head stride for X (F6: 0 = one input row shared by all heads) and
+              an optional split of the K groups (FP32 partials; splitk_reduce adds them in split order, adds
+              the bias once and rounds once).
   readout     F3: the head tail and the mix of one layer: skip terms, softplus, cumulative horizons, P64,
               the log-domain mixture logit z, and a count of non-finite z.
   publish     F3: valid = (step > 0) & (no non-finite z); count the non-finite tokens; clear the count.
@@ -24,7 +27,6 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-SQRT1_2 = tl.constexpr(0.7071067811865476)  # torch GELU kAlpha = M_SQRT1_2, rounded to FP32 in the kernel
 SOFTPLUS_THRESHOLD = tl.constexpr(20.0)  # torch F.softplus default (beta 1): x above it returns x
 
 
@@ -65,22 +67,14 @@ def state_own(ROUTES, STEP, EMA, AGE, ROUTED, AGE_TABLE, RESIDENT, X, beta, one_
 
 
 @triton.jit
-def _gelu_bf16(y):
-    """torch F.gelu (exact erf form) of a BF16 value: FP32 x * 0.5 * (1 + erf(x * kAlpha)), BF16 out."""
-    x = y.to(tl.float32)
-    t = libdevice.add_rn(1.0, libdevice.erf(libdevice.mul_rn(x, SQRT1_2)))
-    return libdevice.mul_rn(libdevice.mul_rn(x, 0.5), t).to(tl.bfloat16)
-
-
-@triton.jit
-def qgemv2(X, W, S, B, Y, P, N, K, KG, X_HEAD_STRIDE, G_PER_SPLIT, HAS_BIAS: tl.constexpr, GELU: tl.constexpr,
-           SPLIT: tl.constexpr, GROUP: tl.constexpr, BLOCK_N: tl.constexpr):
+def qgemv2(X, W, S, B, Y, P, N, K, KG, X_HEAD_STRIDE, G_PER_SPLIT, HAS_BIAS: tl.constexpr, SPLIT: tl.constexpr,
+           GROUP: tl.constexpr, BLOCK_N: tl.constexpr):
     """Y[h, n] = BF16(sum_k W[h, n, k] * S[h, n, k // GROUP] * X[h * X_HEAD_STRIDE + k] (+ B[h, n])).
 
     The loop body is qbank.qgemv's. Grid (H, cdiv(N, BLOCK_N), SPLIT). SPLIT == 1: the qgemv epilogue
-    (bias in FP32, BF16 rounding), then GELU when set. SPLIT > 1: program s sums the groups
+    (bias in FP32, BF16 rounding). SPLIT > 1: program s sums the groups
     s * G_PER_SPLIT .. min((s + 1) * G_PER_SPLIT, KG) - 1 into P[s, h, n] (FP32), and splitk_reduce
-    finishes; Y, B and GELU are then unused here."""
+    finishes; Y and B are then unused here."""
     h = tl.program_id(0)
     n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     s_id = tl.program_id(2)
@@ -99,19 +93,15 @@ def qgemv2(X, W, S, B, Y, P, N, K, KG, X_HEAD_STRIDE, G_PER_SPLIT, HAS_BIAS: tl.
     if SPLIT == 1:
         if HAS_BIAS:
             acc += tl.load(B + h * N + n, mask=n_ok, other=0.0).to(tl.float32)
-        y = acc.to(tl.bfloat16)
-        if GELU:
-            y = _gelu_bf16(y)
-        tl.store(Y + h * N + n, y, mask=n_ok)
+        tl.store(Y + h * N + n, acc.to(tl.bfloat16), mask=n_ok)
     else:
         H = tl.num_programs(0)
         tl.store(P + (s_id * H + h) * N + n, acc, mask=n_ok)
 
 
 @triton.jit
-def splitk_reduce(P, B, Y, HN, HAS_BIAS: tl.constexpr, GELU: tl.constexpr, SPLIT: tl.constexpr,
-                  BLOCK: tl.constexpr):
-    """Y[i] = BF16(((P[0, i] + P[1, i]) + ...) + B[i]) for i < HN = H * N, then GELU when set."""
+def splitk_reduce(P, B, Y, HN, HAS_BIAS: tl.constexpr, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    """Y[i] = BF16(((P[0, i] + P[1, i]) + ...) + B[i]) for i < HN = H * N."""
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     ok = i < HN
     acc = tl.load(P + i, mask=ok, other=0.0)
@@ -119,10 +109,7 @@ def splitk_reduce(P, B, Y, HN, HAS_BIAS: tl.constexpr, GELU: tl.constexpr, SPLIT
         acc = libdevice.add_rn(acc, tl.load(P + s * HN + i, mask=ok, other=0.0))
     if HAS_BIAS:
         acc = libdevice.add_rn(acc, tl.load(B + i, mask=ok, other=0.0).to(tl.float32))
-    y = acc.to(tl.bfloat16)
-    if GELU:
-        y = _gelu_bf16(y)
-    tl.store(Y + i, y, mask=ok)
+    tl.store(Y + i, acc.to(tl.bfloat16), mask=ok)
 
 
 @triton.jit

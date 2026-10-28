@@ -7,16 +7,18 @@ C0  Components on the EXP585 fixtures (the P0 checks, adapted to the fast call s
     advance_and_own the state is bit-exact (fixture ema and age; routed equal to SharedEvict.advance) and
     x equals SharedEvict's own features in the w_layer layout bit for bit. Each stage gets the ORIGINAL
     path's input of that stage: every pre-activation is within the unchanged P0 tolerance of
-    reference_linear (exp585_window_checks.qgemv_ratio <= 1); each GELU epilogue output is within one
-    BF16 spacing of F.gelu of the same pre-activation; both wbx slices are within the P0 tolerance of the
+    reference_linear (exp585_window_checks.qgemv_ratio <= 1); each GELU output (torch F.gelu after the
+    matvec, not fused) is within one BF16 spacing of F.gelu of the same pre-activation and equal to it
+    bit for bit; both wbx slices are within the P0 tolerance of the
     original wb and wb64 stages. Bit equality with qbank.qlinear is reported, not gated. The fast trunk's
     own assembly is checked too: its fc1 input must equal the bytes that the original heads code builds
     from the fast w_layer and h_proj outputs, and each later stage must read the previous fast output.
     The criteria are recorded, reported, then asserted by one pytest.fail(C0_REJECT ...), the only C0
     failure that step B treats as a numerical rejection of the variant.
-C1  qgemv2 shapes outside the bundle's: N not a multiple of BLOCK_N, K not a multiple of GROUP, groups not
-    divisible by the split count, bias and GELU on and off, head stride 0. The split-K scratch is filled
-    with NaN before each launch, so an unwritten partial fails the finite check.
+C1  fast_linear (the matvec code path) on shapes outside the bundle's: N not a multiple of BLOCK_N, K not a
+    multiple of GROUP, groups not divisible by the split count, bias and GELU on and off, head stride 0.
+    The split-K scratch is filled with NaN before each call, so an unwritten partial fails the finite
+    check. The GELU arm must equal F.gelu of the same pre-activation bit for bit.
 C2  readout + publish against the ORIGINAL torch code (SharedEvict.heads tail and SharedEvict.mix, run
     with the same wb and wb64 outputs) on fixture inputs and adversarial inputs (large signed values,
     cancellation, near ties, softplus threshold 20, exp underflow to subnormals, NaN and inf). Declared
@@ -115,7 +117,7 @@ def _ratio(y, x, codes, scale, bias, group) -> torch.Tensor:
 
 
 def _gelu_ratio(post: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
-    """|post - F.gelu(pre)| in BF16 spacings of the reference; the epilogue must stay within one."""
+    """|post - F.gelu(pre)| in BF16 spacings of the reference; the GELU output must stay within one."""
     ref = F.gelu(pre)
     assert bool(torch.isfinite(post).all()) and bool(torch.isfinite(ref).all())
     return (post.float() - ref.float()).abs() / wc.bf16_spacing(ref)
@@ -124,7 +126,7 @@ def _gelu_ratio(post: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
 # --- C0: components on the fixtures ---------------------------------------------------------------------
 
 C0_REJECT = 'C0 numerical rejection: '  # exp586_gpu_window.C0_REJECT; the runner binds the two
-C0_CRITERIA = ('state_exact', 'x_exact', 'assembly_exact', 'stage_ratio_le_1', 'gelu_spacings_le_1')
+C0_CRITERIA = ('state_exact', 'x_exact', 'assembly_exact', 'stage_ratio_le_1', 'gelu_spacings_le_1', 'gelu_equal')
 
 
 def _recording(s, log: list):
@@ -173,7 +175,7 @@ def test_c0_components(variant):
     exact = dict.fromkeys(worst, 0)
     gelu_exact = dict.fromkeys(gelu_worst, 0)
     total = dict.fromkeys(worst, 0)
-    bad = dict(state=[], x=[], assembly=[])
+    bad = dict(state=[], x=[], assembly=[], gelu=[])
     events = scored = 0
     for e in fx['events']:
         if e['kind'] == 'reset':
@@ -227,6 +229,8 @@ def test_c0_components(variant):
                 r = _gelu_ratio(post, pre)
                 gelu_worst[name] = max(gelu_worst[name], float(r.max()))
                 gelu_exact[name] += int((r == 0).sum())
+                if not torch.equal(post, F.gelu(pre)):
+                    bad['gelu'].append((events, name))
         he = calls[5][0]
         assert torch.equal(he, calls[6][0])
         out = s.matvec(he, 'wbx')
@@ -239,7 +243,8 @@ def test_c0_components(variant):
             total[name] += part.numel()
     assert scored == sum(e['expect']['valid'] for e in fx['events']) > 0 and events == len(fx['events'])
     criteria = dict(state_exact=not bad['state'], x_exact=not bad['x'], assembly_exact=not bad['assembly'],
-                    stage_ratio_le_1=max(worst.values()) <= 1.0, gelu_spacings_le_1=max(gelu_worst.values()) <= 1.0)
+                    stage_ratio_le_1=max(worst.values()) <= 1.0, gelu_spacings_le_1=max(gelu_worst.values()) <= 1.0,
+                    gelu_equal=not bad['gelu'])
     assert tuple(criteria) == C0_CRITERIA
     failed = [k for k, ok in criteria.items() if not ok]
     _report('c0', variant=variant, completed=True, criteria=criteria, failed=failed, events=events, scored=scored,
@@ -262,8 +267,10 @@ C1_CASES = [  # H, N, K, block_n, split, bias, gelu, shared_row
 
 @pytest.mark.parametrize('case', C1_CASES)
 def test_c1_qgemv2_shapes(case):
-    from commitmoe_prefetch import fast_kernels as fk
-    from commitmoe_prefetch.shared_evict_fast import NO_FTZ, REDUCE_BLOCK, split_groups
+    """shared_evict_fast.fast_linear, the code path of FastSharedEvict.matvec, on shapes outside the
+    bundle's. The pre-activation must stay within the P0 tolerance; the GELU arm must equal F.gelu of the
+    same pre-activation bit for bit (and so within the unchanged one-spacing limit)."""
+    from commitmoe_prefetch.shared_evict_fast import fast_linear
     import triton
     H, N, Kd, block_n, split, has_bias, gelu, shared = case
     group = 128
@@ -274,33 +281,22 @@ def test_c1_qgemv2_shapes(case):
     bias = torch.randn(H, N, generator=g).to(CUDA) if has_bias else None
     x = torch.randn(1 if shared else H, Kd, generator=g).to(BF).to(CUDA)
     xin = x.expand(H, -1).contiguous() if shared else x
-    stride = 0 if shared else Kd
-    y = torch.empty(H, N, dtype=BF, device=CUDA)
-    b = bias if bias is not None else y
     values = {}
     for act in ((False, True) if gelu else (False,)):
-        if split == 1:
-            fk.qgemv2[(H, triton.cdiv(N, block_n), 1)](x, codes, scale, b, y, y, N, Kd, KG, stride, KG,
-                                                       HAS_BIAS=has_bias, GELU=act, SPLIT=1, GROUP=group,
-                                                       BLOCK_N=block_n, num_warps=4, **NO_FTZ)
-        else:
-            P = torch.full((split, H, N), float('nan'), device=CUDA)
-            fk.qgemv2[(H, triton.cdiv(N, block_n), split)](x, codes, scale, y, y, P, N, Kd, KG, stride,
-                                                           split_groups(KG, split), HAS_BIAS=False, GELU=False,
-                                                           SPLIT=split, GROUP=group, BLOCK_N=block_n,
-                                                           num_warps=4, **NO_FTZ)
-            assert bool(torch.isfinite(P).all()), 'a partial was not written'
-            fk.splitk_reduce[(triton.cdiv(H * N, REDUCE_BLOCK),)](P, b, y, H * N, HAS_BIAS=has_bias, GELU=act,
-                                                                 SPLIT=split, BLOCK=REDUCE_BLOCK, num_warps=4,
-                                                                 **NO_FTZ)
+        P = torch.full((split, H, N), float('nan'), device=CUDA) if split > 1 else None
+        y = fast_linear(x, codes, scale, bias, group, block_n, P, shared, act)
         torch.cuda.synchronize()
+        if P is not None:
+            assert bool(torch.isfinite(P).all()), 'a partial was not written'
         if not act:
             pre = y.clone()
             values['pre_ratio_max'] = float(_ratio(pre, xin, codes, scale, bias, group).max())
         else:
             values['gelu_spacings_max'] = float(_gelu_ratio(y, pre).max())
+            values['gelu_equal'] = bool(torch.equal(y, F.gelu(pre)))
     _report('c1', case=list(case), **values)
     assert values['pre_ratio_max'] <= 1.0 and values.get('gelu_spacings_max', 0.0) <= 1.0, values
+    assert values.get('gelu_equal', True), values
 
 
 # --- C2: readout + publish against the original torch tail ------------------------------------------------
