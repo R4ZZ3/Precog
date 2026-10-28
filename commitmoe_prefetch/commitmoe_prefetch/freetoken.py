@@ -41,6 +41,13 @@ experiments/exp585_export.py; refused together with FREETOKEN_LEARNED_EVICT):
                 own trunk, publish valid = (step > 0) & finite, record scores-ready, and only then
                 run the prefetch bank (trunk and head) and its EMA prior, unchanged.
       L == J    as above; every layer >= J reads its keep row (J from FREETOKEN_LEARNED_EVICT_START).
+
+Fast shared learned eviction (EXP586; FREETOKEN_SHARED_EVICT_FAST = blockn or splitk, the F8 variant of
+shared_evict_fast; needs FREETOKEN_SHARED_EVICT): the same bundle, state and function, scored by
+shared_evict_fast.FastSharedEvict. In this mode only, the probe scores and publishes before it copies the
+bank's raw features (R584 reads score_inputs and raw tid/upcoming_tid/pos, none of the copied fields). The
+copies stay safe after scores-ready: main joins the whole probe stream at the last layer
+(_after_demand), before after_decode writes score_inputs, tid, upcoming_tid and pos of the next token.
 """
 from __future__ import annotations
 
@@ -63,6 +70,7 @@ from .evict import EvictRows
 from .qbank import Int8Bank, qlinear
 from .shared_evict import SharedEvict
 from .shared_evict import load_bundle as load_shared_bundle
+from .shared_evict_fast import F8, FastSharedEvict
 from .spec import PredictorConfig
 
 if TYPE_CHECKING:
@@ -93,6 +101,8 @@ EVICT_ENV, EVICT_START_ENV = 'FREETOKEN_LEARNED_EVICT', 'FREETOKEN_LEARNED_EVICT
 EVICT_TIMING_ENV, EVICT_TIMING_ALL_ENV = 'FREETOKEN_LEARNED_EVICT_TIMING', 'FREETOKEN_LEARNED_EVICT_TIMING_ALL'
 # Shared learned eviction switch (EXP585): an exp585_export.py bundle path. It uses EVICT_START_ENV for J.
 SHARED_EVICT_ENV = 'FREETOKEN_SHARED_EVICT'
+# Fast shared learned eviction (EXP586): the F8 variant name; only with SHARED_EVICT_ENV.
+SHARED_EVICT_FAST_ENV = 'FREETOKEN_SHARED_EVICT_FAST'
 
 
 class PrefetchHooks(DecodeHooks):
@@ -102,7 +112,8 @@ class PrefetchHooks(DecodeHooks):
 
     def __init__(self, cfg: PredictorConfig, state: dict[str, torch.Tensor], demand_stripes: int,
                  evict: tuple[Path, int] | None = None, timing: Path | None = None, timing_all: bool = False,
-                 release_sha256: str | None = None, shared: tuple[Path, int] | None = None):
+                 release_sha256: str | None = None, shared: tuple[Path, int] | None = None,
+                 shared_fast: str | None = None):
         base, feats = cfg.base_model, cfg.features
         layers, sl = base.num_layers, kernels.SECTION_LAYERS
         targets = cfg.target_layers
@@ -123,6 +134,10 @@ class PrefetchHooks(DecodeHooks):
             problems.append(f'{EVICT_ENV} and {SHARED_EVICT_ENV} are two eviction rules; set one')
         if shared is not None and not 0 <= shared[1] < layers:
             problems.append(f'{EVICT_START_ENV}={shared[1]} is not a layer 0..{layers - 1}')
+        if shared_fast is not None and shared is None:
+            problems.append(f'{SHARED_EVICT_FAST_ENV} needs {SHARED_EVICT_ENV}')
+        if shared_fast is not None and shared_fast not in F8:
+            problems.append(f'{SHARED_EVICT_FAST_ENV}={shared_fast!r} is not one of {F8}')
         if timing is not None and evict is None and shared is None:
             problems.append(f'{EVICT_TIMING_ENV} needs {EVICT_ENV} or {SHARED_EVICT_ENV}')
         if problems:
@@ -143,7 +158,7 @@ class PrefetchHooks(DecodeHooks):
         self.stamp_rows: list[torch.Tensor] = []
         self.stamp_steps: list[int] = []
         self.learned: LearnedEvict | None = None
-        self.shared_cfg = shared
+        self.shared_cfg, self.shared_fast = shared, shared_fast
         self.shared: SharedEvict | None = None
 
     # -- setup ---------------------------------------------------------------------
@@ -212,7 +227,10 @@ class PrefetchHooks(DecodeHooks):
             meta, tensors = load_shared_bundle(path, self.release_sha256, L, E, K, base.hidden_size,
                                                self.bank.buffers['table'],
                                                feats.position_scale, cfg.serving_reference.int8_group)
-            self.shared = SharedEvict(meta, tensors, dev, qlinear)
+            if self.shared_fast is None:
+                self.shared = SharedEvict(meta, tensors, dev, qlinear)
+            else:  # the torch path on a CPU device (tests), the fused kernels on the GPU
+                self.shared = FastSharedEvict(meta, tensors, dev, self.shared_fast, kernels=dev.type == 'cuda')
             del tensors
             # End-of-token-t residency (slot >= 0, the rule of the overlap path), written on main in observe(0).
             self.resident = torch.zeros(L, E, dtype=torch.float32, device=dev)
@@ -224,8 +242,8 @@ class PrefetchHooks(DecodeHooks):
             self.scores_ready = torch.cuda.Event()
             self.stamps = torch.zeros(L + 3, dtype=torch.int64, device=dev)
             self.nonfinite_tokens = torch.zeros(1, dtype=torch.int64, device=dev)
-            logger.info('shared learned eviction: all %d layers from layer %d, R584 %.1f MiB (%s)',
-                        L, start, self.shared.nbytes / 2**20, path)
+            logger.info('shared learned eviction: all %d layers from layer %d, R584 %.1f MiB (%s), fast %s',
+                        L, start, self.shared.nbytes / 2**20, path, self.shared_fast)
         logger.info('expert predictor: %d heads L%02d-L%02d, int8 bank %.1f MiB, stage %d MiB, caps %s',
                     H, self.first, L - 1, self.bank.nbytes / 2**20, STAGE_BYTES // 2**20, list(self.caps))
 
@@ -371,22 +389,15 @@ class PrefetchHooks(DecodeHooks):
         At step 0 the inputs are the reset zeros and no token was decoded yet, so the
         prior must not move; the mask keeps it on the device.
         """
-        raw, inputs, feats = self.raw, self.score_inputs, self.cfg.features
-        h, routes, prev, rl = inputs['h'], inputs['routes'], inputs['prev'], inputs['rl']
-        lo, hi = self.first, self.first + self.heads
-        o = self.offset
-        raw['h'].copy_(h[lo + o:hi + o])
-        raw['h_prev'].copy_(h[lo + o - 1:hi + o - 1])
-        for d in range(1, feats.route_window + 1):
-            raw['win'][:, d - 1].copy_(routes[lo - d:hi - d])
-        for d in range(1, feats.previous_token_window + 1):
-            raw['prevwin'][:, d - 1].copy_(prev[lo - d:hi - d])
-        raw['curr'].copy_(routes[lo:hi])
-        raw['rl'].copy_(torch.cat([rl[lo - d:hi - d] for d in range(1, feats.router_logit_window + 1)], 1))
+        raw, feats = self.raw, self.cfg.features
+        if self.shared_fast is None:
+            self._copy_raw()
         if self.learned is None:
             self.probs.copy_(self.bank(raw))
         elif self.shared is not None:
             self._score_shared()
+            if self.shared_fast is not None:
+                self._copy_raw()  # EXP586 F1: after scores-ready (module docstring)
             self.probs.copy_(self.bank(raw))
         else:
             g = self.bank.trunk(raw)
@@ -410,9 +421,32 @@ class PrefetchHooks(DecodeHooks):
         prior.scatter_(1, raw['curr'], prior.gather(1, raw['curr']) + (1 - beta))
         prior.copy_(torch.where(self.step > 0, prior, before))
 
+    def _copy_raw(self) -> None:
+        """The prefetch bank's raw features of the target heads from the end-of-token-t inputs."""
+        raw, inputs, feats = self.raw, self.score_inputs, self.cfg.features
+        h, routes, prev, rl = inputs['h'], inputs['routes'], inputs['prev'], inputs['rl']
+        lo, hi = self.first, self.first + self.heads
+        o = self.offset
+        raw['h'].copy_(h[lo + o:hi + o])
+        raw['h_prev'].copy_(h[lo + o - 1:hi + o - 1])
+        for d in range(1, feats.route_window + 1):
+            raw['win'][:, d - 1].copy_(routes[lo - d:hi - d])
+        for d in range(1, feats.previous_token_window + 1):
+            raw['prevwin'][:, d - 1].copy_(prev[lo - d:hi - d])
+        raw['curr'].copy_(routes[lo:hi])
+        raw['rl'].copy_(torch.cat([rl[lo - d:hi - d] for d in range(1, feats.router_logit_window + 1)], 1))
+
     def _score_shared(self) -> None:
         """R584 keep scores of all layers (EXP585), published before the prefetch bank runs."""
         raw, inputs, keep = self.raw, self.score_inputs, self.learned.keep
+        if self.shared_fast is not None:
+            self.shared.score(inputs['routes'], self.step, self.resident, inputs['h'], raw['tid'],
+                              raw['upcoming_tid'], raw['pos'][:1], self.bank.buffers['table'], keep,
+                              self.learned.valid, self.nonfinite_tokens)
+            if self.timing is not None:
+                kernels.stamp[(1,)](self.stamps, IDX=self.cfg.base_model.num_layers)
+            self.scores_ready.record()
+            return
         self.shared.advance(inputs['routes'], self.step)
         keep.copy_(self.shared.scores(self.shared.own(self.resident), inputs['h'], raw['tid'], raw['upcoming_tid'],
                                       raw['pos'][:1], self.bank.buffers['table']))
@@ -528,7 +562,7 @@ def create_decode_hooks(source: str, config: EngineConfig) -> PrefetchHooks:
     release = json.loads((folder / 'manifest.json').read_text())['files']['model.safetensors']  # verified above
     return PrefetchHooks(cfg, state, config.moe_demand_copy_stripes, evict_from_env(os.environ),
                          Path(timing) if timing else None, os.environ.get(EVICT_TIMING_ALL_ENV) == '1', release,
-                         shared_evict_from_env(os.environ))
+                         shared_evict_from_env(os.environ), shared_fast_from_env(os.environ))
 
 
 def evict_from_env(env) -> tuple[Path, int] | None:
@@ -553,3 +587,15 @@ def shared_evict_from_env(env) -> tuple[Path, int] | None:
     if start is None:
         raise ValueError(f'{SHARED_EVICT_ENV} is set; {EVICT_START_ENV} must give the first learned layer')
     return Path(bundle), int(start)
+
+
+def shared_fast_from_env(env) -> str | None:
+    """The F8 variant when fast shared learned eviction (EXP586) is switched on, else None."""
+    variant = env.get(SHARED_EVICT_FAST_ENV)
+    if not variant:
+        return None
+    if not env.get(SHARED_EVICT_ENV):
+        raise ValueError(f'{SHARED_EVICT_FAST_ENV} is set; it needs {SHARED_EVICT_ENV}')
+    if variant not in F8:
+        raise ValueError(f'{SHARED_EVICT_FAST_ENV}={variant!r} is not one of {F8}')
+    return variant
