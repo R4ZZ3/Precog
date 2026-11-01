@@ -121,7 +121,7 @@ def device_hooks(module, cfg, monkeypatch, rule: str, timing: Path | None, tmp_p
     hooks.demand.stream = FakeStream('demand', rec)
     hooks.demand.launch = lambda cache, layer_id, stages: rec.log.append(('demand', layer_id))
     # Set by bind(); the fake kernels do not read them. Fixed values, so that both logs carry them.
-    hooks.hosts = hooks.stage_ptrs = None
+    hooks.hosts = hooks.stage_ptrs = hooks.feat_bytes = None
     hooks.num_banks, hooks.quota = 2, 64
     return hooks
 

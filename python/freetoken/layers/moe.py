@@ -436,7 +436,7 @@ class OffloadMoELayer(MoELayer):
         from freetoken.layers.quantization.moe.base import limit_or_inf
         from freetoken.moe.legacy_format import canonical_role
 
-        t = {canonical_role(name): v for name, v in zip(cache.bank_schema, cache.bank_views())}
+        t = {canonical_role(name): v for name, v in zip(cache.bank_schema, cache.pool_bank_views(self.layer_id))}
         return fused_experts_decode_fp8_blockscale_split(
             hidden_states, t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"],
             topk_weights, topk_ids, resident, finish, self.activation, float(self.alpha), limit_or_inf(self),

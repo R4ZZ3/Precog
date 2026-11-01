@@ -259,10 +259,18 @@ class PrefetchHooks(DecodeHooks):
             raise ValueError(f'expert predictor expects {base.num_layers} layers x {base.num_experts} experts, '
                              f'the offload cache has {cache.num_layers} x {cache.num_experts}')
         self.demand.check_cache(cache)
+        # The engine refuses the hooks unless the cache has one slot pool, and a pool holds layers of
+        # one bank layout, so one row-size tensor serves every layer. Read it again on every bind:
+        # a cache rebuild makes new descriptors.
+        if len(cache.layouts) != 1:
+            raise ValueError(f'expert predictor needs one bank layout, the offload cache has {len(cache.layouts)}')
+        self.feat_bytes = cache._copy_feat_bytes[cache.layer_layout[0]]
         slots = kernels.GROUPS * kernels.SLOTS
         offset, views = 0, []
-        for _, dest in cache.banks:
-            size = slots * dest[0].numel() * dest.element_size()
+        # Size each stage region from the copy descriptor, not from the bank tensor: HEAD stores
+        # padded layouts as flat uint8 banks, where one bank element is one byte, not one expert row.
+        for row_bytes in self.feat_bytes.tolist():
+            size = slots * int(row_bytes)
             if offset + size > STAGE_BYTES:
                 raise ValueError(f'{slots} stage slots of every bank need more than {STAGE_BYTES // 2**20} MiB')
             views.append(self.storage[offset:offset + size])
@@ -270,7 +278,7 @@ class PrefetchHooks(DecodeHooks):
         self.stage_ptrs = torch.tensor([v.data_ptr() for v in views], dtype=torch.int64, device=self.storage.device)
         self.hosts = torch.stack(cache._copy_src_ptrs).contiguous()  # (layers, banks) host row pointers
         self.num_banks = len(views)
-        words = sum(int(b) // 8 for b in cache._copy_feat_bytes.tolist())
+        words = sum(int(b) // 8 for b in self.feat_bytes.tolist())
         chunks = triton.cdiv(words, kernels.CHUNK_BYTES // 8)  # chunks per expert
         self.quota = kernels.SLOTS * chunks  # one pump call may try every chunk of a full section
         if self.shared is not None:
@@ -532,7 +540,7 @@ class PrefetchHooks(DecodeHooks):
                                                 SPAN_POW2=triton.next_power_of_2(sl * E), SLOTS=kernels.SLOTS,
                                                 SECTION_LAYERS=sl, STRIPES=kernels.PUMP_STRIPES, num_warps=8)
                 kernels.publishing_pump[(kernels.PUMP_STRIPES,)](
-                    self.hosts, self.stage_ptrs, cache._copy_feat_bytes, self.busy, self.layer, self.step,
+                    self.hosts, self.stage_ptrs, self.feat_bytes, self.busy, self.layer, self.step,
                     self.records, self.cursors, self.payload, self.stats, demand.ids, demand.ready, demand.gen,
                     SECTION=section, CAP=self.caps[section],
                     FIRST_STEP=self.cfg.serving_reference.first_prefetch_step, NUM_BANKS=self.num_banks,

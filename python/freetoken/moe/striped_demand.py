@@ -82,7 +82,8 @@ class StripedDemand:
     def check_cache(self, cache) -> None:
         if not cache._copy_fused_ok:
             raise RuntimeError("--moe-demand-copy-stripes needs the fused copy path (every layer pinned on the host)")
-        if bool((cache._copy_feat_bytes % 8 != 0).any()):
+        # HEAD keeps one row-size tensor per bank layout (a list), not one tensor.
+        if any(bool((sizes % 8 != 0).any()) for sizes in cache._copy_feat_bytes):
             raise RuntimeError("--moe-demand-copy-stripes copies 8-byte words; an expert row is not a multiple of 8 bytes")
 
     def reset(self) -> None:
@@ -97,8 +98,11 @@ class StripedDemand:
         read, because every ``ids`` entry is -1.
         """
         hosts = cache._copy_src_ptrs[layer]
-        demand_copy[(len(cache._copy_dst_ptrs), self.stripes)](
-            cache._copy_dst_ptrs, hosts, hosts if stages is None else stages, cache._copy_feat_bytes,
+        # The destination is the slot bank of this layer's pool and the row sizes are those of its
+        # layout, as in HEAD's own copy path (OffloadMoeCache.copy_missing_experts).
+        dst = cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer]]
+        demand_copy[(len(dst), self.stripes)](
+            dst, hosts, hosts if stages is None else stages, cache._copy_feat_bytes[cache.layer_layout[layer]],
             cache.evict_slots, cache.src_indices, cache.num_indices,
             self.ids if ids is None else ids, self.ready if ready is None else ready,
             self.gen if gen is None else gen, self.choices, self.counters[layer],

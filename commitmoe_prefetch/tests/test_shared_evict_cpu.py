@@ -462,7 +462,35 @@ def test_hooks_refuse_a_bundle_of_another_release(cfg, monkeypatch, tmp_path):
 def test_bind_refuses_a_slot_map_of_another_shape(shared):
     """bind() with a slot map that is not (layers, experts); the stage setup before the check has no banks."""
     cache = SimpleNamespace(num_layers=40, num_experts=256, slot_for_id=torch.zeros(39, 256, dtype=torch.int32),
-                            banks=[], _copy_src_ptrs=[torch.zeros(1, dtype=torch.int64)], _copy_feat_bytes=torch.zeros(1))
+                            banks=[], layouts=[()], layer_layout=[0] * 40,
+                            _copy_src_ptrs=[torch.zeros(1, dtype=torch.int64)],
+                            _copy_feat_bytes=[torch.zeros(1, dtype=torch.int64)])
     shared.demand.check_cache = lambda c: None
     with pytest.raises(ValueError, match='slot map'):
         shared.bind(None, cache)
+
+
+def raw_bank_cache(rows: list[int], layouts: int = 1):
+    """A one-pool cache whose banks are flat uint8 tensors, as HEAD stores a padded layout."""
+    banks = [(None, torch.zeros(1 << 20, dtype=torch.uint8)) for _ in rows]
+    return SimpleNamespace(num_layers=40, num_experts=256, slot_for_id=torch.full((40, 256), -1, dtype=torch.int32),
+                           banks=banks, layouts=[()] * layouts, layer_layout=[0] * 40,
+                           _copy_src_ptrs=[torch.zeros(len(rows), dtype=torch.int64)] * 40,
+                           _copy_feat_bytes=[torch.tensor(rows, dtype=torch.int64)] * layouts)
+
+
+def test_bind_sizes_stage_regions_from_the_copy_rows(shared):
+    """On a raw uint8 bank one element is one byte; each stage region must hold full expert rows."""
+    rows = [4096, 64]
+    shared.demand.check_cache = lambda c: None
+    shared.bind(None, raw_bank_cache(rows))
+    slots = ft.kernels.GROUPS * ft.kernels.SLOTS
+    ptrs = shared.stage_ptrs.tolist()
+    assert ptrs[1] - ptrs[0] == slots * rows[0]
+    assert shared.feat_bytes.tolist() == rows and shared.num_banks == 2
+
+
+def test_bind_refuses_two_bank_layouts(shared):
+    shared.demand.check_cache = lambda c: None
+    with pytest.raises(ValueError, match='one bank layout'):
+        shared.bind(None, raw_bank_cache([64], layouts=2))

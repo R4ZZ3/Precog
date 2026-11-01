@@ -31,15 +31,49 @@ def _demand_stub():
 
 
 def test_refuses_cache_without_fused_copy():
-    cache = SimpleNamespace(_copy_fused_ok=False, _copy_feat_bytes=torch.tensor([64]))
+    cache = SimpleNamespace(_copy_fused_ok=False, _copy_feat_bytes=[torch.tensor([64])])
     with pytest.raises(RuntimeError, match="fused copy path"):
         _demand_stub().check_cache(cache)
 
 
-def test_refuses_rows_not_a_multiple_of_8_bytes():
-    cache = SimpleNamespace(_copy_fused_ok=True, _copy_feat_bytes=torch.tensor([64, 260]))
+# HEAD a2ce636 keeps one row-size tensor per bank layout: _copy_feat_bytes is a list of tensors.
+@pytest.mark.parametrize("sizes", [[[64, 260]], [[64, 128], [64, 260]]])
+def test_refuses_rows_not_a_multiple_of_8_bytes(sizes):
+    cache = SimpleNamespace(_copy_fused_ok=True, _copy_feat_bytes=[torch.tensor(s) for s in sizes])
     with pytest.raises(RuntimeError, match="multiple of 8"):
         _demand_stub().check_cache(cache)
+
+
+def test_accepts_aligned_rows_of_every_layout():
+    cache = SimpleNamespace(_copy_fused_ok=True, _copy_feat_bytes=[torch.tensor([64, 128]), torch.tensor([8])])
+    _demand_stub().check_cache(cache)
+
+
+def test_launch_passes_the_pool_and_layout_descriptors_of_its_layer(monkeypatch):
+    """Layer 1 sits in pool 1 with layout 1: the kernel gets that pool's slot pointers and that layout's rows."""
+    import freetoken.moe.striped_demand as sd
+
+    seen = {}
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def run(dst, hosts, stages, feat, *rest, **meta):
+                seen.update(grid=grid, dst=dst, hosts=hosts, feat=feat)
+            return run
+
+    monkeypatch.setattr(sd, "demand_copy", Kernel())
+    demand = _demand_stub()
+    demand.ids = demand.ready = demand.gen = None
+    demand.num_experts, demand.stage_slots, demand.stripes = 4, 2, 16
+    pools = [torch.tensor([1, 2]), torch.tensor([3, 4, 5])]
+    rows = [torch.tensor([16, 32]), torch.tensor([48, 64, 80])]
+    hosts = [torch.tensor([7, 8]), torch.tensor([9, 10, 11])]
+    cache = SimpleNamespace(_copy_dst_ptrs=pools[0], _copy_dst_ptrs_pool=pools, pool_of_layer=[0, 1],
+                            layer_layout=[0, 1], _copy_feat_bytes=rows, _copy_src_ptrs=hosts,
+                            evict_slots=None, src_indices=None, num_indices=None)
+    demand.launch(cache, 1)
+    assert seen["dst"] is pools[1] and seen["feat"] is rows[1] and seen["hosts"] is hosts[1]
+    assert seen["grid"] == (3, 16)
 
 
 def test_hooks_reset_per_request_and_replace_the_engine_copy():
