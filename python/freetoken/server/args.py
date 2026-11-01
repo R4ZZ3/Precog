@@ -728,12 +728,43 @@ def parse_args(
     parser.add_argument(
         "--expert-load",
         default=ServerArgs.expert_load,
-        choices=["auto", "serial", "parallel"],
+        choices=["auto", "serial", "parallel", "bounded"],
         help=(
             "How MoE expert banks are read into host RAM. 'auto' (default) reads scattered "
             "experts in parallel (fast) but falls back to serial when free RAM can't cover "
             "the banks + the parallel reader's extra whole-shard buffer; 'serial' forces the "
-            "low-memory reclaimable read (slower); 'parallel' forces the fast read."
+            "low-memory reclaimable read (slower); 'parallel' forces the fast read; 'bounded' is the "
+            "parallel read that copies tensors out and frees each shard, without read-ahead."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-demand-copy-stripes",
+        type=int,
+        default=ServerArgs.moe_demand_copy_stripes,
+        help=(
+            "Copy decode cache misses with N CTAs per bank on a high-priority stream (16 measured fastest "
+            "on an RTX 4080). 0 keeps the fused copy. Needs every MoE layer pinned on the host."
+        ),
+    )
+
+    parser.add_argument(
+        "--expert-predictor",
+        default=ServerArgs.expert_predictor,
+        help=(
+            "Prefetch predicted experts into the GPU during decode. A local folder or Hugging Face "
+            "repo of a predictor for the served checkpoint. Needs the commitmoe-prefetch package, "
+            "--moe-strategy offload and --max-running-requests 1."
+        ),
+    )
+
+    parser.add_argument(
+        "--pretouch-host-banks",
+        action="store_true",
+        default=ServerArgs.pretouch_host_banks,
+        help=(
+            "Write every host expert bank once when it is allocated, before any checkpoint shard is read, "
+            "so the banks get their pages before the shard buffers. Commits the full bank size in RAM at start."
         ),
     )
 

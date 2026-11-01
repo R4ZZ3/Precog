@@ -1,0 +1,15 @@
+Expert predictor for Qwen/Qwen3.5-35B-A3B-FP8
+Copyright 2026 Rasmus Toivanen
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The heads were trained on routing traces of Qwen/Qwen3.5-35B-A3B-FP8
+(Apache-2.0, https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8). The measured runs
+used FreeToken by FlashML-org (Apache-2.0, https://github.com/FlashML-org/FreeToken).
+This repository contains no code or weights from either project.
+
+Data notice: the training prompts include Stanford Alpaca (non-commercial terms,
+https://github.com/tatsu-lab/stanford_alpaca) and CodeAlpaca (CC BY-NC 4.0 in the
+original repository, https://github.com/sahil280114/codealpaca). The weights learn the
+base model's routing decisions, not the prompt text. How the dataset terms apply to
+such weights is not settled. Check the dataset terms before commercial use.

@@ -25,6 +25,12 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# EXP538 (research, off by default): compute the resident routes while the demand copy runs, then
+# the missing routes after it. FP8 block experts on the Triton kernel, with decode hooks that can
+# split their copy (DecodeHooks.begin_copy: the striped demand copy, with or without the expert
+# predictor). The output is bit-identical to the one-pass GEMM.
+_OVERLAP_RESIDENT = os.getenv("FREETOKEN_OVERLAP_RESIDENT", "0") == "1"
+
 
 class MoELayer(BaseOP):
     """Resident routed experts.
@@ -234,7 +240,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        return self._decode_routed(hidden_states, topk_weights, topk_ids, router_logits)
 
     def prefill_forward(
         self,
@@ -262,6 +268,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -281,8 +288,14 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        hooks = cache.decode_hooks
+        if hooks is not None:
+            hooks.observe(self.layer_id, hidden_states, router_logits, topk_ids)
+        if _OVERLAP_RESIDENT:
+            return self._decode_overlap(cache, hooks, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+        if hooks is None or not hooks.copy_missing(cache, self.layer_id):
+            cache.copy_missing()
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -398,6 +411,36 @@ class OffloadMoELayer(MoELayer):
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
     # ------------------------------------------------------------------
+
+    def _decode_overlap(self, cache: OffloadMoeCache, hooks, hidden_states: torch.Tensor,
+                        topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        """The decode GPU path with FREETOKEN_OVERLAP_RESIDENT=1 (EXP538).
+
+        The residency mask is read from the slot map before this layer's ensure_experts: a route
+        is resident when its expert holds a cache slot before the copy is planned. A route served
+        from a predictor stage slot is not resident (the stage-to-slot copy is part of the demand
+        copy), so it runs in pass 2. ensure_experts stamps every hit of this layer with the new
+        clock and never evicts a stamped slot (lru_ensure and learned_ensure alike), so the copy
+        never writes a slot that pass 1 reads.
+        """
+        method = self.quant_method
+        if hooks is None or type(method).__name__ != "Fp8BlockMoEMethod" \
+                or type(method.kernel).__name__ != "TritonFp8BlockMoEKernel" or self.apply_router_weight_on_input:
+            # the one-pass FP8 decode (fused_experts_decode_fp8_block) also rejects router weights on the input
+            raise RuntimeError("FREETOKEN_OVERLAP_RESIDENT needs FP8 block experts on the Triton kernel, router "
+                               "weights on the output and --moe-demand-copy-stripes")
+        resident = (cache.slot_for_id[self.layer_id].index_select(0, topk_ids.reshape(-1)) >= 0).to(torch.int32)
+        cache.ensure_experts(self.layer_id, topk_ids)
+        finish = hooks.begin_copy(cache, self.layer_id)
+        from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_decode_fp8_blockscale_split
+        from freetoken.layers.quantization.moe.base import limit_or_inf
+        from freetoken.moe.legacy_format import canonical_role
+
+        t = {canonical_role(name): v for name, v in zip(cache.bank_schema, cache.bank_views())}
+        return fused_experts_decode_fp8_blockscale_split(
+            hidden_states, t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"],
+            topk_weights, topk_ids, resident, finish, self.activation, float(self.alpha), limit_or_inf(self),
+        )
 
     def _expert_gemm(
         self,

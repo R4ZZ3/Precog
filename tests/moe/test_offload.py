@@ -498,6 +498,9 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", lambda device=None: None)
     monkeypatch.setattr("freetoken.engine.graph.get_free_memory", lambda device: 1024)
     monkeypatch.setattr("freetoken.engine.graph._upload_graph", lambda graph, stream: None)
+    # the fork's capture-time memory logging queries the CUDA device; this test captures on a CPU device
+    monkeypatch.setattr("freetoken.engine.graph.torch_memory", lambda device: "faked")
+    monkeypatch.setattr("freetoken.engine.graph.memory_phase", lambda device, phase: "faked")
 
     dummy_req = Req(
         input_ids=torch.tensor([0], dtype=torch.int32),

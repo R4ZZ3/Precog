@@ -23,6 +23,7 @@ from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe.decode_hooks import DecodeHooks, charge_reservation
 from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
@@ -31,7 +32,7 @@ from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, r
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, get_free_memory, memory_phase, torch_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -439,6 +440,8 @@ class Engine:
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+        logger.info_rank0(f"Torch memory before loading model: {torch_memory(self.device)}")
+        logger.info_rank0(memory_phase(self.device, "before_load"))
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -456,6 +459,7 @@ class Engine:
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
         post_weights_free = self._sync_get_memory()[0]
+        logger.info_rank0(memory_phase(self.device, "after_weights"))
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
@@ -465,6 +469,9 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self.decode_hooks = _load_decode_hooks(config)
+        self._hooks_uid: int | None = None
+        self._hooks_step = 0
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -475,10 +482,13 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
+        logger.info_rank0(memory_phase(self.device, "after_host_tables"))
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
+            logger.info_rank0(memory_phase(self.device, "after_moe_cache"))
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        logger.info_rank0(memory_phase(self.device, "after_prepare"))
         self.encoder_cache = None
         self.mm_processor = None
         if config.active_encoders:
@@ -512,6 +522,7 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        logger.info_rank0(memory_phase(self.device, "after_kv_pool"))
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -529,6 +540,7 @@ class Engine:
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
+        logger.info_rank0(memory_phase(self.device, "after_linear_state"))
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -554,6 +566,8 @@ class Engine:
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+        logger.info_rank0(f"Torch memory after initialization: {torch_memory(self.device)}")
+        logger.info_rank0(memory_phase(self.device, "after_init"))
 
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
@@ -660,7 +674,7 @@ class Engine:
                 method=layers[0].quant_method,
                 device=self.device,
                 dummy=config.use_dummy_weight,
-                parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
+                parallel=_expert_parallel(config),
                 resident=True,
                 layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
             )
@@ -711,6 +725,11 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        if config.num_page_override is not None:
+            # --num-pages is kept after the plan, so the experts may only take what those pages leave;
+            # min_reserve stays a floor (DSV4 adds its working set and drift slack there)
+            kv_reserve_tokens = max(config.num_page_override * page_tokens, min_reserve)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -721,12 +740,16 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        if self.decode_hooks is not None:
+            charged = charge_reservation(self, self.decode_hooks)
+            logger.info_rank0(f"decode hooks: {charged / 2**20:.1f} MiB charged to the weights before cache sizing")
+            logger.info_rank0(memory_phase(self.device, "after_hooks_reserve"))
         from freetoken.moe.expert_banks import is_mixed
 
         method = shared_offload_method(self.model)
@@ -745,7 +768,7 @@ class Engine:
         # expert-tensor granularity. Both pin-after-fill.
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
-        expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        expert_parallel = _expert_parallel(config)
         check_locked_fetch_config(config)
         # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
         # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
@@ -774,6 +797,9 @@ class Engine:
             config.moe_cache_split, config.model_path,
             config.model_config.num_moe_layers, config.model_config.num_experts,
         )
+        from freetoken.moe.host_banks import set_pretouch
+
+        set_pretouch(config.pretouch_host_banks)
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -788,6 +814,8 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+        finally:
+            set_pretouch(False)
         banks, probed, staging = settle_banks(config, banks, probe=probe, has_locked=split_residency)
         if probe:
             cpu_layer_ids = probed
@@ -913,6 +941,10 @@ class Engine:
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.moe_offload_cache = cache
+        if self.decode_hooks is not None:
+            _refuse_hooks_bypass(cache)
+            cache.decode_hooks = self.decode_hooks
+            self.decode_hooks.bind(self, cache)
         return cache
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
@@ -1258,6 +1290,12 @@ class Engine:
         aligned_max_seq_len = self.page_table.shape[1]
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+        if self.decode_hooks is not None and self.moe_offload_cache is not None:
+            # Before every recapture, not only after an expert-cache resize: a cache rebuild
+            # reallocates the copy descriptors and miss lists, and every recapture runs dummy
+            # forwards that must start from the hooks' reset state, not the last request's.
+            _refuse_hooks_bypass(self.moe_offload_cache)
+            self.decode_hooks.bind(self, self.moe_offload_cache)
         gc.collect()
         free_min = self._sync_get_memory()[0]
         self.graph_runner = GraphRunner(
@@ -1291,6 +1329,12 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        # Decode hooks: request/step setup before the forward, after_decode after sampling (it needs
+        # next_tokens_gpu). The lifecycle lives here, not in forward_logits, so it runs once per decode step.
+        hooks = self.decode_hooks
+        consumed = None
+        if hooks is not None:
+            consumed = self._hooks_before_forward(hooks, batch)
         logits = self.forward_logits(batch)
 
         for req in batch.reqs:
@@ -1298,10 +1342,31 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if hooks is not None and consumed is not None:
+            hooks.after_decode(self._hooks_step, consumed, next_tokens_gpu)
+            self._hooks_step += 1
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _hooks_before_forward(self, hooks: DecodeHooks, batch: Batch) -> torch.Tensor | None:
+        """Track the request and decode step for the hooks; return the consumed token ids.
+
+        Hooks without per-request state also serve larger batches; they get no request or step calls.
+        """
+        if batch.size != 1:
+            if hooks.single_request:
+                raise RuntimeError(f"--expert-predictor serves one request at a time, got a batch of {batch.size}")
+            return None
+        uid = batch.reqs[0].uid
+        if batch.is_prefill or uid != self._hooks_uid:
+            self._hooks_uid, self._hooks_step = uid, 0
+            hooks.begin_request(uid)
+        if not batch.is_decode:
+            return None
+        hooks.before_decode(self._hooks_step)
+        return batch.input_ids.clone()
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1552,6 +1617,103 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _refuse_hooks_bypass(cache: OffloadMoeCache) -> None:
+    """Refuse decode hooks on a resolved cache whose decode path would skip them.
+
+    The hooks (predictor prefetch, learned and shared eviction, striped demand copies) run only on the
+    GPU offload path of OffloadMoeLayer.decode: a CPU layer returns into the CPU executor and a hybrid
+    target returns into _decode_hybrid before hooks.observe/copy_missing, and learned_ensure sits in
+    ensure_experts, which hybrid never calls. Without this check such a serve would silently run plain
+    LRU and report it as the hook arm. learned_ensure and the shared-eviction path also read
+    id_of_slot/slot_for_id/usage as one global slot space, which holds only with one slot pool.
+
+    The check reads the cache after every resolution step (--moe-cpu-layers auto, the pin probe, locked
+    fetch, --moe-cache-scope, mixed formats), not the CLI flags, and runs before graph capture.
+    """
+    problems = []
+    if cache.decode_target != "gpu":
+        problems.append(f"decode target {cache.decode_target!r} (needs 'gpu': every layer on the GPU offload path)")
+    if cache.cpu_layer_ids:
+        problems.append(f"CPU or locked MoE layers {sorted(cache.cpu_layer_ids)}")
+    if cache.locked_hybrid:
+        problems.append(f"locked-fetch layers {sorted(cache.locked_hybrid)}")
+    if len(cache.pool_sizes) != 1:
+        problems.append(f"{len(cache.pool_sizes)} MoE slot pools (needs one shared pool)")
+    if problems:
+        raise ValueError("decode hooks (--expert-predictor, learned/shared eviction, --moe-demand-copy-stripes) "
+                         "cannot run with " + "; ".join(problems))
+
+
+def _expert_parallel(config: EngineConfig) -> bool | None:
+    """--expert-load -> load_expert_banks(parallel=...); 'bounded' is the parallel read with bounded memory."""
+    from freetoken.models.weight import set_bounded_reader
+
+    set_bounded_reader(config.expert_load == "bounded")
+    return {"serial": False, "parallel": True, "bounded": True}.get(config.expert_load, None)
+
+
+def _load_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
+    """The decode hooks, optionally wrapped by a research diagnostic (routing_recorder.py).
+
+    FREETOKEN_ROUTING_RECORD_DIR wraps them in the routing recorder. FREETOKEN_PROFILE_REQUESTS
+    (comma-separated request indexes) wraps them in a profiler window for nsys. Both need hooks
+    to wrap, so they refuse to run when neither --expert-predictor nor
+    --moe-demand-copy-stripes is set. With both, the profiler window wraps the recorder: one serve
+    then gives the routes, selections and counters of exactly the decode steps it profiles (the
+    pump's stage/host outcome depends on timing, so two serves would not match step by step). The
+    recorder's own kernels are then in the profile; they are named, so an analysis can label them.
+    """
+    hooks = _build_decode_hooks(config)
+    out_dir = os.environ.get("FREETOKEN_ROUTING_RECORD_DIR")
+    profile = os.environ.get("FREETOKEN_PROFILE_REQUESTS")
+    if not out_dir and not profile:
+        return hooks
+    if hooks is None:
+        raise ValueError("FREETOKEN_ROUTING_RECORD_DIR and FREETOKEN_PROFILE_REQUESTS need "
+                         "--expert-predictor or --moe-demand-copy-stripes")
+    from freetoken.moe.routing_recorder import ProfileWindow, RoutingRecorder
+
+    if out_dir:
+        hooks = RoutingRecorder(hooks, out_dir, top_k=config.model_config.num_experts_per_tok)
+    if profile:
+        hooks = ProfileWindow(hooks, frozenset(int(x) for x in profile.split(",")))
+    return hooks
+
+
+def _build_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
+    """Build the --expert-predictor or --moe-demand-copy-stripes hooks, or None.
+
+    Refuses settings the predictor does not serve. The hooks exist before the offload cache,
+    so the memory they reserve is charged before the cache is sized.
+    """
+    if config.expert_predictor is None:
+        if not config.moe_demand_copy_stripes:
+            return None
+        from freetoken.moe.striped_demand import StripedDemandHooks
+
+        model = config.model_config
+        return StripedDemandHooks(model.num_moe_layers, model.num_experts, config.moe_demand_copy_stripes)
+    problems = []
+    if config.moe_strategy != "offload":
+        problems.append(f"--moe-strategy {config.moe_strategy} (needs offload)")
+    if config.moe_cpu_layers:
+        problems.append("--moe-cpu-layers (every layer must decode on the GPU)")
+    if config.max_running_req != 1:
+        problems.append(f"--max-running-requests {config.max_running_req} (needs 1)")
+    graph_sizes = [*(config.cuda_graph_bs or []), config.cuda_graph_max_bs or 1]
+    if max(graph_sizes) > 1:
+        problems.append(f"CUDA graph batch sizes up to {max(graph_sizes)} (needs 1)")
+    if config.moe_demand_copy_stripes < 1:
+        problems.append("--moe-demand-copy-stripes 0 (the predictor's stage is read by the striped copy; 16 was measured)")
+    if problems:
+        raise ValueError("--expert-predictor cannot run with " + ", ".join(problems))
+    try:
+        from commitmoe_prefetch.freetoken import create_decode_hooks
+    except ImportError as exc:
+        raise RuntimeError("--expert-predictor needs the commitmoe-prefetch package") from exc
+    return create_decode_hooks(config.expert_predictor, config)
 
 
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:

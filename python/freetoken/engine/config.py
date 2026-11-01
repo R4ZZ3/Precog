@@ -39,11 +39,12 @@ class EngineConfig:
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
-    # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
+    # Expert-bank host load (--expert-load): auto|serial|parallel|bounded. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    pretouch_host_banks: bool = False  # write each mmap expert bank at allocation, before the shard reads
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
@@ -62,6 +63,10 @@ class EngineConfig:
     # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # --moe-demand-copy-stripes: CTAs per bank for the striped decode demand copy; 0 = the fused copy
+    moe_demand_copy_stripes: int = 0
+    # --expert-predictor: local folder or Hugging Face repo of a commitmoe-prefetch predictor
+    expert_predictor: str | None = None
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

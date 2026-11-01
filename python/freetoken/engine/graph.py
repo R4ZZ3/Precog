@@ -3,7 +3,9 @@ from __future__ import annotations
 import ctypes
 import functools
 import gc
+import json
 import sys
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal
 
@@ -111,6 +113,31 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
     if rc != 0:
         raise RuntimeError(f"cuGraphUpload failed with CUresult {rc}")
     stream.synchronize()
+
+
+def memory_phase(device: torch.device, phase: str) -> str:
+    """One machine-readable memory reading in raw bytes, logged at each init phase so a free-memory
+    deficit can be located in the phase that took it. Unlike Engine._sync_get_memory it does not
+    synchronize, empty the allocator cache or reset the peak counters, so it does not explicitly
+    change allocator state or any sizing input. It is not atomic or synchronized: the queries take
+    time, and asynchronous or outside changes can still move later readings. peak_reserved is the
+    peak since the last _sync_get_memory reset. device_free counts every process on the GPU."""
+    free, total = torch.cuda.mem_get_info(device)
+    reading = dict(phase=phase, wall=round(time.time(), 3),
+                   allocated=torch.cuda.memory_allocated(device), reserved=torch.cuda.memory_reserved(device),
+                   peak_reserved=torch.cuda.max_memory_reserved(device), device_free=free, device_total=total)
+    return "MEMORY_PHASE " + json.dumps(reading, sort_keys=True)
+
+
+def torch_memory(device: torch.device) -> str:
+    """Allocator state next to device-wide free memory. Device free also counts other processes
+    and memory outside the Torch allocator (CUDA context, library workspaces), so the gap between
+    the two separates a Torch allocation change from a context or co-tenant change."""
+    free, total = torch.cuda.mem_get_info(device)
+    gib = 2**30
+    return (f"allocated {torch.cuda.memory_allocated(device) / gib:.3f} GiB, "
+            f"reserved {torch.cuda.memory_reserved(device) / gib:.3f} GiB, "
+            f"device free {free / gib:.3f} of {total / gib:.3f} GiB")
 
 
 class GraphRunner:
@@ -243,6 +270,8 @@ class GraphRunner:
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        logger.info_rank0(f"Torch memory after capturing CUDA graphs: {torch_memory(self.device)}")
+        logger.info_rank0(memory_phase(self.device, "after_capture"))
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return (
