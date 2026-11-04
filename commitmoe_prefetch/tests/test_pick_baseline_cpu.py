@@ -105,8 +105,9 @@ def test_baselines_repeat_for_one_seed_and_change_with_step_and_request():
             assert (a != other).float().mean() > 0.99
 
 
-def test_random_scores_are_unique_enough_for_the_section_cap():
-    """select_scored takes at most 3 per section from 5 x 256 experts, so the top scores must not tie."""
+def test_random_scores_keep_the_top_of_a_section_apart_on_this_step():
+    """select_scored takes at most 3 per section from 5 x 256 experts. 24-bit scores can still tie on another step, and
+    select_scored then takes the lower gid. This is one seeded draw, not a proof that ties never occur."""
     a = ft.hash_unit(IDS[:5], step(1), scalar(1), 600).flatten()
     assert a.topk(16).values.unique().numel() == 16
 
@@ -147,7 +148,7 @@ def make_hooks(cfg, monkeypatch):
 def test_flag_off_keeps_the_bank_scores(make_hooks):
     hooks = make_hooks()
     assert hooks.pick is None and not hooks.layer_counters
-    assert not hasattr(hooks, 'pick_ids') and not hasattr(hooks, 'pick_requests')
+    assert not hasattr(hooks, 'pick_ids') and not hasattr(hooks, 'pick_requests') and not hasattr(hooks, 'layer_published')
     hooks.before_decode(4)
     hooks._score()
     assert hooks.probs.eq(0.5).all()
@@ -164,6 +165,14 @@ def test_a_pick_replaces_the_bank_scores_and_the_prior_moves_the_same(make_hooks
     if kind == 'ema':
         moved = on.raw['prior_before'] > 0
         assert moved.any() and torch.equal(on.probs[moved], on.raw['prior_before'][moved])
+
+
+def test_the_counter_flag_allocates_and_resets_its_buffer(make_hooks):
+    hooks = make_hooks(layer_counters=True)
+    assert hooks.layer_counters and hooks.layer_published.tolist() == [0] * 40
+    hooks.layer_published += 1
+    hooks.begin_request(11)
+    assert hooks.layer_published.tolist() == [0] * 40
 
 
 def test_begin_request_counts_requests_for_the_hash_and_resets_the_prior(make_hooks):

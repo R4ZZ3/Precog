@@ -252,7 +252,8 @@ class PrefetchHooks(DecodeHooks):
             'upcoming_tid': torch.zeros(1, dtype=torch.int64, device=dev),
         }
         self.probs = torch.zeros(H, E, dtype=torch.float32, device=dev)
-        self.layer_published = torch.zeros(L, dtype=torch.int64, device=dev)   # FREETOKEN_LAYER_COUNTERS
+        if self.layer_counters:
+            self.layer_published = torch.zeros(L, dtype=torch.int64, device=dev)
         if self.pick is not None:
             self.pick_ids = torch.arange(self.first * E, (self.first + H) * E, device=dev).view(H, E)
             self.pick_requests = torch.zeros(1, dtype=torch.int64, device=dev)   # begin_request counts
@@ -375,7 +376,8 @@ class PrefetchHooks(DecodeHooks):
             for t in buffers.values():
                 t.zero_()
         self.probs.zero_()
-        self.layer_published.zero_()
+        if self.layer_counters:
+            self.layer_published.zero_()
         if self.pick is not None:
             self.pick_requests.add_(1)   # the same request order gives the same hash in each serve of an arm
         self.records.fill_(-1)
@@ -615,7 +617,8 @@ class PrefetchHooks(DecodeHooks):
                 kernels.publishing_pump[(kernels.PUMP_STRIPES,)](
                     self.hosts, self.stage_ptrs, self.feat_bytes, self.busy, self.layer, self.step,
                     self.records, self.cursors, self.payload, self.stats, demand.ids, demand.ready, demand.gen,
-                    self.layer_published,
+                    # With COUNT_LAYERS off the kernel never reads this pointer, so an existing buffer stands there.
+                    self.layer_published if self.layer_counters else self.stats,
                     SECTION=section, CAP=self.caps[section],
                     FIRST_STEP=self.cfg.serving_reference.first_prefetch_step, NUM_BANKS=self.num_banks,
                     E=self.cfg.base_model.num_experts, QUOTA=self.quota, SLOTS=kernels.SLOTS,
