@@ -113,9 +113,10 @@ PICK_BASELINE_ENV, PICK_SEED_ENV = 'FREETOKEN_PICK_BASELINE', 'FREETOKEN_PICK_SE
 PICK_BASELINES = ('random', 'ema')
 # With value 1: per-layer published counts and one more log line per request (EXP600, untimed serves).
 LAYER_COUNTERS_ENV = 'FREETOKEN_LAYER_COUNTERS'
-# Below every prior of an expert used in the last 240 tokens (0.1 * 0.9 ** 240 is about 1e-12), and fp32
-# holds it beside a prior of zero. So the tie-break cannot reorder experts with recent use.
-EMA_TIE_BREAK = 1e-12
+# The ema pick scores a never-used expert at this value times a hash under 1. A positive prior after a single use in
+# a 512-token answer is at least 0.1 * 0.9 ** 511, about 4e-25, so every used expert ranks above every unused one.
+# fp32 holds the product as a normal number (the hash is at least 2 ** -24 or exactly 0), so ties stay rare.
+EMA_ZERO_SCALE = 1e-30
 # Odd constants under 2**31 (murmur2 and murmur3). A masked value under 2**32 times one of them stays under 2**63, so
 # no product overflows int64 and the low 32 bits are exact on every device.
 _MUL = (0x5BD1E995, 0x1B873593)
@@ -125,9 +126,9 @@ _MASK32 = 0xFFFFFFFF
 def hash_unit(ids: torch.Tensor, step: torch.Tensor, request: torch.Tensor, seed: int) -> torch.Tensor:
     """A value in [0, 1) per id, fixed by (id, step, request, seed): two xor-shift and multiply rounds.
 
-    Trap: a torch random call inside a captured CUDA graph keeps its generator state outside the graph,
-    so it cannot be trusted to give new values per replay. This hash reads the step and request buffers,
-    which the main stream updates before each replay.
+    This fixed function is the registered random policy of the EXP600 study: both serves of an arm draw the same
+    values, and a test can state them. The step and request buffers carry the only state, and the main stream
+    updates them before each replay.
     """
     x = (ids + step.to(torch.int64) * 0x9E3779B1 + (request + seed) * 0x61C88647) & _MASK32
     x = x ^ (x >> 16)
@@ -143,7 +144,10 @@ def baseline_scores(kind: str, prior: torch.Tensor, ids: torch.Tensor, step: tor
     """Scores (heads, E) of a baseline pick. Both are causal at the end of token t: random reads no
     model input, and the prior holds routes of tokens up to t."""
     u = hash_unit(ids, step, request, seed)
-    return u if kind == 'random' else prior + EMA_TIE_BREAK * u
+    # An additive jitter could reorder two used experts with close priors. This form keeps every unequal prior in its
+    # exact order and randomizes only the experts that were never used in this request. Equal priors above 0 go to the
+    # lower expert id, the kernel's rule.
+    return u if kind == 'random' else torch.where(prior > 0, prior, EMA_ZERO_SCALE * u)
 
 
 def pick_baseline_from_env(env) -> tuple[str, int] | None:
@@ -616,7 +620,7 @@ class PrefetchHooks(DecodeHooks):
                     FIRST_STEP=self.cfg.serving_reference.first_prefetch_step, NUM_BANKS=self.num_banks,
                     E=self.cfg.base_model.num_experts, QUOTA=self.quota, SLOTS=kernels.SLOTS,
                     SECTION_LAYERS=sl, STRIPES=kernels.PUMP_STRIPES, CHUNK_BYTES=kernels.CHUNK_BYTES,
-                    COUNT_LAYERS=self.layer_counters, num_warps=8)
+                    **({'COUNT_LAYERS': True} if self.layer_counters else {}), num_warps=8)
         if layer_id == self.cfg.base_model.num_layers - 1:
             if self.timing is not None:
                 kernels.stamp[(1,)](self.join_stamps, IDX=0)

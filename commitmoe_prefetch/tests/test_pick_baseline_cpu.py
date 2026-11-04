@@ -1,10 +1,16 @@
-"""CPU tests of the EXP600 baseline picks: the hash, the scores and the switches. No model, no device."""
+"""CPU tests of the EXP600 baseline picks: the hash, the scores, the switches and flag-off behavior. No device."""
 from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from commitmoe_prefetch import freetoken as ft
+from commitmoe_prefetch.spec import PredictorConfig
 
 E = 256
 H = 34
@@ -58,19 +64,116 @@ def test_random_scores_ignore_the_prior():
     assert torch.equal(a, ft.baseline_scores('random', torch.zeros(H, E), IDS, step(5), scalar(1), 600))
 
 
-def test_ema_scores_keep_the_order_of_used_experts_and_break_ties_among_unused():
+def test_ema_scores_keep_every_unequal_prior_in_exact_order():
+    """The whole range of one use in a 512-token answer, plus a pair one fp32 step apart. A jitter would reorder that pair."""
+    used = 0.1 * 0.9 ** torch.linspace(0, 511, 200, dtype=torch.float64)
     prior = torch.zeros(1, E)
-    used = 0.1 * 0.9 ** torch.arange(0, 200, dtype=torch.float32)   # last use from 0 to 199 tokens ago
-    prior[0, :200] = used
+    prior[0, :200] = used.to(torch.float32)
+    prior[0, 200] = torch.nextafter(prior[0, 100], torch.tensor(0.0))   # just under row 100
     u = ft.baseline_scores('ema', prior, IDS[:1], step(5), scalar(1), 600)
-    assert u[0, :200].argsort(descending=True).tolist() == list(range(200))
-    unused = u[0, 200:]
-    assert (unused > 0).all() and unused.unique().numel() > 50 and unused.max() < used.min()
-    assert unused.argmax() != 0   # a plain prior would give the kernel's lowest id
+    assert torch.equal(u[0, :201], prior[0, :201])
+    order = u[0, :201].argsort(descending=True, stable=True).tolist()
+    assert order.index(100) + 1 == order.index(200)
 
 
-def test_the_tie_break_is_under_a_use_240_tokens_ago():
-    assert ft.EMA_TIE_BREAK <= 0.1 * 0.9 ** 240 * 1.1
+def test_ema_scores_randomize_only_the_never_used_experts_and_rank_them_last():
+    prior = torch.zeros(1, E)
+    prior[0, 0] = 0.1 * 0.9 ** 511   # the smallest prior in the registered 512-token maximum
+    u = ft.baseline_scores('ema', prior, IDS[:1], step(5), scalar(1), 600)
+    unused = u[0, 1:]
+    assert unused.max() < u[0, 0] and unused.max() < 1e-30
+    assert unused.unique().numel() > 200    # 255 hash draws of 24 bits: fp32 keeps them apart
+    assert unused.min() == 0 or unused.min() >= torch.finfo(torch.float32).tiny   # never a subnormal that a flush would zero
+    assert unused.argmax() != 0     # a plain prior would give the kernel's lowest id
+
+
+def test_ema_ties_above_zero_keep_the_kernel_rule():
+    prior = torch.zeros(1, E)
+    prior[0, [7, 9, 200]] = 0.25
+    u = ft.baseline_scores('ema', prior, IDS[:1], step(5), scalar(1), 600)
+    assert u[0, 7] == u[0, 9] == u[0, 200] == 0.25
+    assert int(u[0].argmax()) == 7
+
+
+def test_baselines_repeat_for_one_seed_and_change_with_step_and_request():
+    prior = torch.zeros(H, E)
+    for kind in ft.PICK_BASELINES:
+        a = ft.baseline_scores(kind, prior, IDS, step(9), scalar(2), 600)
+        assert torch.equal(a, ft.baseline_scores(kind, prior, IDS, step(9), scalar(2), 600))
+        for other in (ft.baseline_scores(kind, prior, IDS, step(10), scalar(2), 600),
+                      ft.baseline_scores(kind, prior, IDS, step(9), scalar(3), 600)):
+            assert (a != other).float().mean() > 0.99
+
+
+def test_random_scores_are_unique_enough_for_the_section_cap():
+    """select_scored takes at most 3 per section from 5 x 256 experts, so the top scores must not tie."""
+    a = ft.hash_unit(IDS[:5], step(1), scalar(1), 600).flatten()
+    assert a.topk(16).values.unique().numel() == 16
+
+
+@pytest.fixture
+def cfg():
+    published = Path(os.environ.get('COMMITMOE_PREDICTOR_DIR', '/nonexistent'))
+    if not (published / 'config.json').is_file():
+        pytest.skip('published folder absent')
+    return PredictorConfig.model_validate(json.loads((published / 'config.json').read_text()))
+
+
+class _StubBank:
+    """A fixed bank output, so that a test can see whether the pick replaced it."""
+
+    def __init__(self, cfg, state, device):
+        self.nbytes = 0
+        self.out = torch.full((len(cfg.target_layers), cfg.base_model.num_experts), 0.5)
+
+    def __call__(self, raw):
+        return self.out
+
+
+@pytest.fixture
+def make_hooks(cfg, monkeypatch):
+    monkeypatch.setattr(ft, 'Int8Bank', _StubBank)
+    monkeypatch.setattr(torch.cuda, 'Stream', lambda **kwargs: None)  # no device on the CPU runner
+
+    def make(**kwargs):
+        hooks = ft.PrefetchHooks(cfg, {}, demand_stripes=16, **kwargs)
+        hooks.reserve(SimpleNamespace(device=torch.device('cpu')))
+        hooks.begin_request(-1)
+        hooks.score_inputs['routes'][:, :] = torch.arange(8)
+        return hooks
+    return make
+
+
+def test_flag_off_keeps_the_bank_scores(make_hooks):
+    hooks = make_hooks()
+    assert hooks.pick is None and not hooks.layer_counters
+    assert not hasattr(hooks, 'pick_ids') and not hasattr(hooks, 'pick_requests')
+    hooks.before_decode(4)
+    hooks._score()
+    assert hooks.probs.eq(0.5).all()
+
+
+@pytest.mark.parametrize('kind', ft.PICK_BASELINES)
+def test_a_pick_replaces_the_bank_scores_and_the_prior_moves_the_same(make_hooks, kind):
+    off, on = make_hooks(), make_hooks(pick=(kind, 600))
+    for hooks in (off, on):
+        hooks.before_decode(4)
+        hooks._score()
+    assert not on.probs.eq(0.5).any()
+    assert torch.equal(on.raw['prior_before'], off.raw['prior_before'])
+    if kind == 'ema':
+        moved = on.raw['prior_before'] > 0
+        assert moved.any() and torch.equal(on.probs[moved], on.raw['prior_before'][moved])
+
+
+def test_begin_request_counts_requests_for_the_hash_and_resets_the_prior(make_hooks):
+    hooks = make_hooks(pick=('ema', 600))
+    start = int(hooks.pick_requests)
+    hooks.before_decode(4)
+    hooks._score()
+    assert hooks.raw['prior_before'].any()
+    hooks.begin_request(11)
+    assert int(hooks.pick_requests) == start + 1 and not hooks.raw['prior_before'].any()
 
 
 @pytest.mark.parametrize('env, want', [({}, None), ({'FREETOKEN_PICK_BASELINE': ''}, None),
