@@ -106,6 +106,57 @@ EVICT_TIMING_ENV, EVICT_TIMING_ALL_ENV = 'FREETOKEN_LEARNED_EVICT_TIMING', 'FREE
 SHARED_EVICT_ENV = 'FREETOKEN_SHARED_EVICT'
 # Fast shared learned eviction (EXP586): the F8 variant name; only with SHARED_EVICT_ENV.
 SHARED_EVICT_FAST_ENV = 'FREETOKEN_SHARED_EVICT_FAST'
+# Baseline picks for the EXP600 comparison, off by default. The bank still runs, so that its cost stays
+# in the arm; only the scores that select_scored reads change. random: a hash of (expert, step, request,
+# seed). ema: the EMA prior after token t, with the hash as a tie-break among never-used experts.
+PICK_BASELINE_ENV, PICK_SEED_ENV = 'FREETOKEN_PICK_BASELINE', 'FREETOKEN_PICK_SEED'
+PICK_BASELINES = ('random', 'ema')
+# With value 1: per-layer published counts and one more log line per request (EXP600, untimed serves).
+LAYER_COUNTERS_ENV = 'FREETOKEN_LAYER_COUNTERS'
+# Below every prior of an expert used in the last 240 tokens (0.1 * 0.9 ** 240 is about 1e-12), and fp32
+# holds it beside a prior of zero. So the tie-break cannot reorder experts with recent use.
+EMA_TIE_BREAK = 1e-12
+# Odd constants under 2**31 (murmur2 and murmur3). A masked value under 2**32 times one of them stays under 2**63, so
+# no product overflows int64 and the low 32 bits are exact on every device.
+_MUL = (0x5BD1E995, 0x1B873593)
+_MASK32 = 0xFFFFFFFF
+
+
+def hash_unit(ids: torch.Tensor, step: torch.Tensor, request: torch.Tensor, seed: int) -> torch.Tensor:
+    """A value in [0, 1) per id, fixed by (id, step, request, seed): two xor-shift and multiply rounds.
+
+    Trap: a torch random call inside a captured CUDA graph keeps its generator state outside the graph,
+    so it cannot be trusted to give new values per replay. This hash reads the step and request buffers,
+    which the main stream updates before each replay.
+    """
+    x = (ids + step.to(torch.int64) * 0x9E3779B1 + (request + seed) * 0x61C88647) & _MASK32
+    x = x ^ (x >> 16)
+    x = (x * _MUL[0]) & _MASK32
+    x = x ^ (x >> 13)
+    x = (x * _MUL[1]) & _MASK32
+    x = x ^ (x >> 16)
+    return (x >> 8).to(torch.float32) * 2.0 ** -24   # 24 bits: exact in fp32, so the value stays under 1
+
+
+def baseline_scores(kind: str, prior: torch.Tensor, ids: torch.Tensor, step: torch.Tensor,
+                    request: torch.Tensor, seed: int) -> torch.Tensor:
+    """Scores (heads, E) of a baseline pick. Both are causal at the end of token t: random reads no
+    model input, and the prior holds routes of tokens up to t."""
+    u = hash_unit(ids, step, request, seed)
+    return u if kind == 'random' else prior + EMA_TIE_BREAK * u
+
+
+def pick_baseline_from_env(env) -> tuple[str, int] | None:
+    """(kind, seed) when a baseline pick is switched on, else None (the published scores)."""
+    kind = env.get(PICK_BASELINE_ENV)
+    if not kind:
+        return None
+    if kind not in PICK_BASELINES:
+        raise ValueError(f'{PICK_BASELINE_ENV}={kind!r}: need one of {PICK_BASELINES}')
+    seed = env.get(PICK_SEED_ENV)
+    if seed is None or not seed.isdigit():
+        raise ValueError(f'{PICK_BASELINE_ENV} is set; {PICK_SEED_ENV} must give a seed of digits, got {seed!r}')
+    return kind, int(seed)
 
 
 class PrefetchHooks(DecodeHooks):
@@ -116,7 +167,8 @@ class PrefetchHooks(DecodeHooks):
     def __init__(self, cfg: PredictorConfig, state: dict[str, torch.Tensor], demand_stripes: int,
                  evict: tuple[Path, int] | None = None, timing: Path | None = None, timing_all: bool = False,
                  release_sha256: str | None = None, shared: tuple[Path, int] | None = None,
-                 shared_fast: str | None = None):
+                 shared_fast: str | None = None, pick: tuple[str, int] | None = None,
+                 layer_counters: bool = False):
         base, feats = cfg.base_model, cfg.features
         layers, sl = base.num_layers, kernels.SECTION_LAYERS
         targets = cfg.target_layers
@@ -164,6 +216,7 @@ class PrefetchHooks(DecodeHooks):
         self.learned: LearnedEvict | None = None
         self.shared_cfg, self.shared_fast = shared, shared_fast
         self.shared: SharedEvict | None = None
+        self.pick, self.layer_counters = pick, layer_counters
 
     # -- setup ---------------------------------------------------------------------
 
@@ -195,6 +248,10 @@ class PrefetchHooks(DecodeHooks):
             'upcoming_tid': torch.zeros(1, dtype=torch.int64, device=dev),
         }
         self.probs = torch.zeros(H, E, dtype=torch.float32, device=dev)
+        self.layer_published = torch.zeros(L, dtype=torch.int64, device=dev)   # FREETOKEN_LAYER_COUNTERS
+        if self.pick is not None:
+            self.pick_ids = torch.arange(self.first * E, (self.first + H) * E, device=dev).view(H, E)
+            self.pick_requests = torch.zeros(1, dtype=torch.int64, device=dev)   # begin_request counts
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode step of the running graph
         slots, stripes = kernels.GROUPS * kernels.SLOTS, kernels.PUMP_STRIPES
         self.demand = StripedDemand(L, E, self.demand_stripes, stage_slots=slots, device=dev)
@@ -252,6 +309,10 @@ class PrefetchHooks(DecodeHooks):
                         L, start, self.shared.nbytes / 2**20, path, self.shared_fast)
         logger.info('expert predictor: %d heads L%02d-L%02d, int8 bank %.1f MiB, stage %d MiB, caps %s',
                     H, self.first, L - 1, self.bank.nbytes / 2**20, STAGE_BYTES // 2**20, list(self.caps))
+        if self.pick is not None:
+            logger.info('expert predictor: baseline picks %s, seed %d', *self.pick)
+        if self.layer_counters:
+            logger.info('expert predictor: layer counters on')
 
     def bind(self, engine, cache: OffloadMoeCache) -> None:
         base = self.cfg.base_model
@@ -297,6 +358,8 @@ class PrefetchHooks(DecodeHooks):
             # Decode misses (stage + host) of every layer, for per-layer comparisons (EXP526).
             per_layer = self.demand.counters[:, :2].sum(1).tolist()
             logger.info('expert predictor: request %s, misses per layer: %s', self.uid, per_layer)
+            if self.layer_counters:
+                logger.info('expert predictor: request %s, layer counters: %s', self.uid, self._layer_counts())
             if self.timing is not None and self.stamp_rows:
                 torch.save(dict(stamps=torch.stack(self.stamp_rows).cpu(), step=torch.tensor(self.stamp_steps),
                                 join=torch.stack(self.join_rows).cpu(), start_layer=self.learned.start_layer),
@@ -308,6 +371,9 @@ class PrefetchHooks(DecodeHooks):
             for t in buffers.values():
                 t.zero_()
         self.probs.zero_()
+        self.layer_published.zero_()
+        if self.pick is not None:
+            self.pick_requests.add_(1)   # the same request order gives the same hash in each serve of an arm
         self.records.fill_(-1)
         self.cursors.zero_()
         self.payload.zero_()
@@ -436,6 +502,9 @@ class PrefetchHooks(DecodeHooks):
         prior.mul_(beta)
         prior.scatter_(1, raw['curr'], prior.gather(1, raw['curr']) + (1 - beta))
         prior.copy_(torch.where(self.step > 0, prior, before))
+        if self.pick is not None:
+            kind, seed = self.pick
+            self.probs.copy_(baseline_scores(kind, prior, self.pick_ids, self.step, self.pick_requests, seed))
 
     def _copy_raw(self) -> None:
         """The prefetch bank's raw features of the target heads from the end-of-token-t inputs."""
@@ -542,11 +611,12 @@ class PrefetchHooks(DecodeHooks):
                 kernels.publishing_pump[(kernels.PUMP_STRIPES,)](
                     self.hosts, self.stage_ptrs, self.feat_bytes, self.busy, self.layer, self.step,
                     self.records, self.cursors, self.payload, self.stats, demand.ids, demand.ready, demand.gen,
+                    self.layer_published,
                     SECTION=section, CAP=self.caps[section],
                     FIRST_STEP=self.cfg.serving_reference.first_prefetch_step, NUM_BANKS=self.num_banks,
                     E=self.cfg.base_model.num_experts, QUOTA=self.quota, SLOTS=kernels.SLOTS,
                     SECTION_LAYERS=sl, STRIPES=kernels.PUMP_STRIPES, CHUNK_BYTES=kernels.CHUNK_BYTES,
-                    num_warps=8)
+                    COUNT_LAYERS=self.layer_counters, num_warps=8)
         if layer_id == self.cfg.base_model.num_layers - 1:
             if self.timing is not None:
                 kernels.stamp[(1,)](self.join_stamps, IDX=0)
@@ -555,6 +625,12 @@ class PrefetchHooks(DecodeHooks):
                 kernels.stamp[(1,)](self.join_stamps, IDX=1)
 
     # -- reporting -----------------------------------------------------------------
+
+    def _layer_counts(self) -> dict[str, list[int]]:
+        """Per-layer counters of the current request (synchronizes the device). Published counts by target layer."""
+        counters = self.demand.counters.tolist()
+        return dict(published=self.layer_published.tolist(), from_stage=[c[0] for c in counters],
+                    from_host=[c[1] for c in counters], host_while_pending=[c[2] for c in counters])
 
     def summary(self) -> dict[str, int]:
         """Counters of the current request (synchronizes the device)."""
@@ -582,7 +658,8 @@ def create_decode_hooks(source: str, config: EngineConfig) -> PrefetchHooks:
     release = json.loads((folder / 'manifest.json').read_text())['files']['model.safetensors']  # verified above
     return PrefetchHooks(cfg, state, config.moe_demand_copy_stripes, evict_from_env(os.environ),
                          Path(timing) if timing else None, os.environ.get(EVICT_TIMING_ALL_ENV) == '1', release,
-                         shared_evict_from_env(os.environ), shared_fast_from_env(os.environ))
+                         shared_evict_from_env(os.environ), shared_fast_from_env(os.environ),
+                         pick_baseline_from_env(os.environ), os.environ.get(LAYER_COUNTERS_ENV) == '1')
 
 
 def evict_from_env(env) -> tuple[Path, int] | None:

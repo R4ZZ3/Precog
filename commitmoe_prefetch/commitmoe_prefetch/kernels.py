@@ -116,10 +116,12 @@ def select_scored(MAP, PROBS, STEP, RECORDS, CURSORS, PAYLOAD, SECTION: tl.const
 
 @triton.jit
 def publishing_pump(HOSTS, STAGES, SIZES, BUSY, LAYER, STEP, RECORDS, CURSORS, PAYLOAD, STATS, IDS, READY, GEN,
+                    LAYER_PUBLISHED,
                     SECTION: tl.constexpr, CAP: tl.constexpr, FIRST_STEP: tl.constexpr, NUM_BANKS: tl.constexpr,
                     E: tl.constexpr, QUOTA: tl.constexpr, SLOTS: tl.constexpr = 4,
                     SECTION_LAYERS: tl.constexpr = 5, STRIPES: tl.constexpr = 8,
-                    CHUNK_BYTES: tl.constexpr = 262144, BLOCK: tl.constexpr = 1024):
+                    CHUNK_BYTES: tl.constexpr = 262144, BLOCK: tl.constexpr = 1024,
+                    COUNT_LAYERS: tl.constexpr = False):
     """Copy the section's first CAP selected experts from the host banks into its stage group.
 
     Each expert is split into CHUNK_BYTES chunks. Every CTA walks the same chunk sequence
@@ -131,6 +133,8 @@ def publishing_pump(HOSTS, STAGES, SIZES, BUSY, LAYER, STEP, RECORDS, CURSORS, P
     publishes IDS[stage slot] = gid, then READY[stage slot] = GEN. demand_copy reads a stage
     only when both match.
     STATS: copied bytes, yields to a demand copy, expired calls, published experts.
+    COUNT_LAYERS (FREETOKEN_LAYER_COUNTERS): LAYER_PUBLISHED[target layer] also counts each
+    published expert. With False the kernel never reads that pointer, so any buffer may stand there.
     """
     pid = tl.program_id(0)
     step = tl.load(STEP)
@@ -184,6 +188,8 @@ def publishing_pump(HOSTS, STAGES, SIZES, BUSY, LAYER, STEP, RECORDS, CURSORS, P
                     tl.atomic_xchg(IDS + stage_slot, gid.to(tl.int32), sem='release')
                     tl.atomic_xchg(READY + stage_slot, tl.load(GEN), sem='release')
                     tl.atomic_add(STATS + 3, 1, sem='relaxed')
+                    if COUNT_LAYERS:
+                        tl.atomic_add(LAYER_PUBLISHED + gid // E, 1, sem='relaxed')
                 cursor += 1
             tl.store(cursor_ptr, cursor)
         attempts += 1

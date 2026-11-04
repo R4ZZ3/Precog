@@ -156,7 +156,7 @@ def test_select_retire_pump_equal_research(legacy, section, cap):
     kernels.select_scored[(1,)](slot_for_id, probs, step, new_records, new_cursors, payload, SECTION=section,
                                 FIRST=6, FIRST_STEP=1, MIN_SCORE=0.0, E=E, SPAN_POW2=2048, num_warps=8)
     kernels.publishing_pump[(8,)](host_ptrs, new_ptrs, sizes_t, busy, layer, step, new_records, new_cursors,
-                                  payload, stats, new_ids, new_ready, gen, SECTION=section, CAP=cap,
+                                  payload, stats, new_ids, new_ready, gen, stats, SECTION=section, CAP=cap,
                                   FIRST_STEP=1, NUM_BANKS=4, E=E, QUOTA=4 * chunks, num_warps=8)
     torch.cuda.synchronize()
 
