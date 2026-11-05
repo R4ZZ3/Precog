@@ -62,6 +62,8 @@ import triton
 from freetoken.moe.decode_hooks import DecodeHooks
 from freetoken.moe.learned_evict import COUNTERS as EVICT_COUNTERS
 from freetoken.moe.learned_evict import LearnedEvict
+from freetoken.moe.position_counters import PositionCounters
+from freetoken.moe.position_counters import folder_from_env as position_folder_from_env
 from freetoken.moe.striped_demand import StripedDemand
 from freetoken.utils import init_logger
 
@@ -87,6 +89,11 @@ logger = init_logger(__name__)
 STAGE_BYTES = 32 * 1024**2
 # Minimum head probability for a copy. The measured run used no gate (EXP497 tested gates).
 MIN_SCORE = 0.0
+# EXP604 switch: a float in [0, 1] replaces MIN_SCORE for this engine. Absent or empty: MIN_SCORE, so the kernel is the one
+# that every earlier serve compiled. The value is a Triton constexpr: each value compiles its own select_scored variant.
+MIN_SCORE_ENV = 'FREETOKEN_MIN_SCORE'
+# EXP605 switch, off by default: a folder for cumulative counters per decode step (freetoken.moe.position_counters).
+POSITION_COUNTERS_ENV = 'FREETOKEN_POSITION_COUNTERS'
 LIVE = ('h', 'rl', 'routes', 'prev')  # per-layer features of the current and previous token
 # Learned eviction switch: a bundle path (exp526_export_evict.py) and the first layer J whose
 # ensure uses the keep scores. J has no default: it must come from the measured scores-ready wait.
@@ -182,7 +189,9 @@ class PrefetchHooks(DecodeHooks):
                  release_sha256: str | None = None, shared: tuple[Path, int] | None = None,
                  shared_fast: str | None = None, pick: tuple[str, int] | None = None,
                  layer_counters: bool = False, no_copies: bool = False, oracle_record: Path | None = None,
-                 oracle_picks: Path | None = None):
+                 oracle_picks: Path | None = None, min_score: float = MIN_SCORE, position_counters: Path | None = None):
+        if not 0.0 <= min_score <= 1.0:   # also refuses NaN
+            raise ValueError(f'min_score {min_score} is outside [0, 1]')
         base, feats = cfg.base_model, cfg.features
         layers, sl = base.num_layers, kernels.SECTION_LAYERS
         targets = cfg.target_layers
@@ -243,6 +252,9 @@ class PrefetchHooks(DecodeHooks):
         self.oracle_request = -1   # ordinal of the requests that reached a decode step, the file index in both modes
         self.oracle_log: list[torch.Tensor] = []
         self.oracle_rows: torch.Tensor | None = None
+        self.min_score = float(min_score)
+        self.position_folder = position_counters
+        self.positions: PositionCounters | None = None   # made in reserve(), where the device is known
 
     # -- setup ---------------------------------------------------------------------
 
@@ -296,6 +308,8 @@ class PrefetchHooks(DecodeHooks):
         self.cursors = torch.zeros((self.sections, stripes), dtype=torch.int32, device=dev)
         self.payload = torch.zeros((self.sections, kernels.SLOTS), dtype=torch.int32, device=dev)
         self.stats = torch.zeros(len(kernels.STATS_FIELDS), dtype=torch.int64, device=dev)
+        if self.position_folder is not None:
+            self.positions = PositionCounters(self.position_folder, dev)
         self.unscored_ids = torch.zeros(1, dtype=torch.int64, device=dev)  # ids replaced by row 0
         self.busy = torch.zeros(1, dtype=torch.int32, device=dev)
         self.layer = torch.full((1,), -1, dtype=torch.int32, device=dev)
@@ -352,6 +366,10 @@ class PrefetchHooks(DecodeHooks):
             logger.info('expert predictor: layer counters on')
         if self.no_copies:
             logger.info('expert predictor: no prefetch copies')
+        if self.min_score != MIN_SCORE:
+            logger.info('expert predictor: min score %r', self.min_score)
+        if self.positions is not None:
+            logger.info('expert predictor: position counters to %s', self.positions.folder)
         if self.oracle_record is not None:
             logger.info('expert predictor: oracle record to %s', self.oracle_record)
         if self.oracle_picks is not None:
@@ -409,6 +427,9 @@ class PrefetchHooks(DecodeHooks):
                            self.timing)
             if self.oracle_record is not None and self.oracle_log:
                 self._write_routes()
+            if self.positions is not None:
+                s = self.summary()
+                self.positions.write(self.uid, self.steps, [s['published'], s['misses_from_stage'], s['misses_from_host']])
         self.uid, self.steps = uid, 0
         # The previous token's graph joined its probe and demand streams into main, so these
         # writes on main are ordered after all of its prefetch work.
@@ -457,8 +478,14 @@ class PrefetchHooks(DecodeHooks):
         if step == 0:
             self.oracle_request += 1
             self.oracle_log = []
+            if self.positions is not None:
+                self._position_snap(0)
         if self.oracle_picks is not None:
             self._oracle_scores(step)
+
+    def _position_snap(self, row: int) -> None:
+        published = self.stats[kernels.STATS_FIELDS.index('published')]
+        self.positions.snap(row, published, self.demand.counters[:, :2].sum(0))
 
     def _oracle_scores(self, step: int) -> None:
         """Mark the routes of this decode step as the picks (main stream, before the graph replays; the probe stream's
@@ -501,6 +528,9 @@ class PrefetchHooks(DecodeHooks):
         # Training covered positions up to 256 tokens; later positions exceed 1.0.
         self.raw['pos'].fill_((step + 1) / self.cfg.features.position_scale)
         self.steps = step + 1
+        if self.positions is not None:
+            # After the graph of this step: its probe and demand streams joined main at the last layer.
+            self._position_snap(step + 1)
         if self.timing is not None:
             self.stamp_rows.append(self.stamps.clone())
             self.join_rows.append(self.join_stamps.clone())
@@ -690,7 +720,7 @@ class PrefetchHooks(DecodeHooks):
                     kernels.select_scored[(1,)](cache.slot_for_id, self.probs, self.step, self.records,
                                                 self.cursors, self.payload, SECTION=section, FIRST=self.first,
                                                 FIRST_STEP=self.cfg.serving_reference.first_prefetch_step,
-                                                MIN_SCORE=MIN_SCORE, E=E,
+                                                MIN_SCORE=self.min_score, E=E,
                                                 SPAN_POW2=triton.next_power_of_2(sl * E), SLOTS=kernels.SLOTS,
                                                 SECTION_LAYERS=sl, STRIPES=kernels.PUMP_STRIPES, num_warps=8)
                 kernels.publishing_pump[(kernels.PUMP_STRIPES,)](
@@ -749,7 +779,22 @@ def create_decode_hooks(source: str, config: EngineConfig) -> PrefetchHooks:
                          shared_evict_from_env(os.environ), shared_fast_from_env(os.environ),
                          pick_baseline_from_env(os.environ), os.environ.get(LAYER_COUNTERS_ENV) == '1',
                          os.environ.get(NO_COPIES_ENV) == '1', _folder_from_env(ORACLE_RECORD_ENV),
-                         _folder_from_env(ORACLE_PICKS_ENV))
+                         _folder_from_env(ORACLE_PICKS_ENV), min_score_from_env(os.environ),
+                         position_folder_from_env(os.environ, POSITION_COUNTERS_ENV))
+
+
+def min_score_from_env(env) -> float:
+    """FREETOKEN_MIN_SCORE as a float in [0, 1]; absent or empty gives MIN_SCORE. A bad value stops the engine start."""
+    value = env.get(MIN_SCORE_ENV)
+    if not value:
+        return MIN_SCORE
+    try:
+        score = float(value)
+    except ValueError as e:
+        raise ValueError(f'{MIN_SCORE_ENV}={value!r} is not a number') from e
+    if not 0.0 <= score <= 1.0:   # also refuses NaN and infinities
+        raise ValueError(f'{MIN_SCORE_ENV}={value!r} is outside [0, 1]')
+    return score
 
 
 def _folder_from_env(name: str) -> Path | None:

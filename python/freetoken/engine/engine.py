@@ -1694,8 +1694,11 @@ def _build_decode_hooks(config: EngineConfig) -> DecodeHooks | None:
         from freetoken.moe.striped_demand import StripedDemandHooks
 
         model = config.model_config
+        from freetoken.moe.position_counters import folder_from_env
+
         return StripedDemandHooks(model.num_moe_layers, model.num_experts, config.moe_demand_copy_stripes,
-                                  log_misses=os.environ.get("FREETOKEN_DEMAND_MISS_LOG") == "1")
+                                  log_misses=os.environ.get("FREETOKEN_DEMAND_MISS_LOG") == "1",
+                                  position_counters=folder_from_env(os.environ))
     problems = []
     if config.moe_strategy != "offload":
         problems.append(f"--moe-strategy {config.moe_strategy} (needs offload)")

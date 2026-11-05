@@ -13,11 +13,14 @@ publishes mid-launch. Without a prefetcher every ``IDS`` entry is -1 and every m
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
 
 from freetoken.moe.decode_hooks import DecodeHooks
+from freetoken.moe.position_counters import PositionCounters
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -132,9 +135,14 @@ class StripedDemandHooks(DecodeHooks):
 
     single_request = False  # no per-request state: every miss reads the host
 
-    def __init__(self, num_layers: int, num_experts: int, stripes: int, log_misses: bool = False):
+    def __init__(self, num_layers: int, num_experts: int, stripes: int, log_misses: bool = False,
+                 position_counters: Path | None = None):
         self.shape = (num_layers, num_experts, stripes)
         self.demand: StripedDemand | None = None
+        # FREETOKEN_POSITION_COUNTERS (EXP605, untimed serves): a folder; per decode step, the cumulative misses. The
+        # folder is made in reserve(), where the device is known.
+        self.position_folder = position_counters
+        self.positions: PositionCounters | None = None
         # FREETOKEN_DEMAND_MISS_LOG (EXP603, untimed serves). The kernel always counts; the flag only logs the
         # counters when the next request starts, which reads the device.
         self.log_misses = log_misses
@@ -145,11 +153,15 @@ class StripedDemandHooks(DecodeHooks):
         num_layers, num_experts, stripes = self.shape
         # without a predictor no stage exists; one slot keeps the kernel's stage lookup trivial
         self.demand = StripedDemand(num_layers, num_experts, stripes, stage_slots=1, device=engine.device)
+        if self.position_folder is not None:
+            self.positions = PositionCounters(self.position_folder, engine.device)
 
     def bind(self, engine, cache) -> None:
         self.demand.check_cache(cache)
         if self.log_misses:
             logger.info("striped demand: miss log on")
+        if self.positions is not None:
+            logger.info("striped demand: position counters to %s", self.positions.folder)
 
     def begin_request(self, uid: int) -> None:
         # The same rule as PrefetchHooks: a long prompt starts one prefill per chunk with one uid, so only a new uid
@@ -157,11 +169,19 @@ class StripedDemandHooks(DecodeHooks):
         if self.log_misses and uid != self.uid and self.steps:
             logger.info("striped demand: request %s, %d decode steps, misses per layer: %s",
                         self.uid, self.steps, self.demand.counters[:, 1].tolist())
+        if self.positions is not None and uid != self.uid and self.steps:
+            self.positions.write(self.uid, self.steps, [0, *self.demand.counters[:, :2].sum(0).tolist()])
         self.uid, self.steps = uid, 0
         self.demand.reset()
 
+    def before_decode(self, step: int) -> None:
+        if self.positions is not None and step == 0:
+            self.positions.snap(0, None, self.demand.counters[:, :2].sum(0))
+
     def after_decode(self, step: int, consumed: torch.Tensor, sampled: torch.Tensor) -> None:
         self.steps = step + 1
+        if self.positions is not None:
+            self.positions.snap(step + 1, None, self.demand.counters[:, :2].sum(0))
 
     def copy_missing(self, cache, layer_id: int) -> bool:
         self.demand.copy(cache, layer_id)
