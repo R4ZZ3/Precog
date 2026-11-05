@@ -113,6 +113,15 @@ PICK_BASELINE_ENV, PICK_SEED_ENV = 'FREETOKEN_PICK_BASELINE', 'FREETOKEN_PICK_SE
 PICK_BASELINES = ('random', 'ema')
 # With value 1: per-layer published counts and one more log line per request (EXP600, untimed serves).
 LAYER_COUNTERS_ENV = 'FREETOKEN_LAYER_COUNTERS'
+# EXP603 switches, off by default. With value 1: R584 eviction alone, no prefetch scoring, no selection and no pump. The
+# bank and stage memory stay allocated, so that the slots do not change.
+NO_COPIES_ENV = 'FREETOKEN_NO_PREFETCH_COPIES'
+# A folder. ORACLE_RECORD: write the routes of every decode step, one file per request. ORACLE_PICKS: read those files and
+# give the routes of the current decode step as the pick scores. An oracle breaks the feature clock on purpose: it is an
+# upper reference, never a deployable arm. The two serves must send the same requests in the same order.
+ORACLE_RECORD_ENV, ORACLE_PICKS_ENV = 'FREETOKEN_ORACLE_RECORD', 'FREETOKEN_ORACLE_PICKS'
+# Trap: MIN_SCORE is 0, so a score of 0 is eligible and fills a slot with the lowest gid. The other experts must score below it.
+ORACLE_NEEDED, ORACLE_OTHER = 1.0, -1.0
 # The ema pick scores a never-used expert at this value times a hash under 1. A positive prior after a single use in
 # a 512-token answer is at least 0.1 * 0.9 ** 511, about 4e-25, so every used expert ranks above every unused one.
 # fp32 holds the product as a normal number (the hash is at least 2 ** -24 or exactly 0), so ties stay rare.
@@ -172,7 +181,8 @@ class PrefetchHooks(DecodeHooks):
                  evict: tuple[Path, int] | None = None, timing: Path | None = None, timing_all: bool = False,
                  release_sha256: str | None = None, shared: tuple[Path, int] | None = None,
                  shared_fast: str | None = None, pick: tuple[str, int] | None = None,
-                 layer_counters: bool = False):
+                 layer_counters: bool = False, no_copies: bool = False, oracle_record: Path | None = None,
+                 oracle_picks: Path | None = None):
         base, feats = cfg.base_model, cfg.features
         layers, sl = base.num_layers, kernels.SECTION_LAYERS
         targets = cfg.target_layers
@@ -199,6 +209,14 @@ class PrefetchHooks(DecodeHooks):
             problems.append(f'{SHARED_EVICT_FAST_ENV}={shared_fast!r} is not one of {F8}')
         if timing is not None and evict is None and shared is None:
             problems.append(f'{EVICT_TIMING_ENV} needs {EVICT_ENV} or {SHARED_EVICT_ENV}')
+        if no_copies and shared_fast is None:
+            problems.append(f'{NO_COPIES_ENV} needs {SHARED_EVICT_FAST_ENV}: only the fused path scores without the raw copy')
+        if no_copies and (pick is not None or oracle_picks is not None):
+            problems.append(f'{NO_COPIES_ENV} leaves no picks to replace')
+        if oracle_picks is not None and pick is not None:
+            problems.append(f'{ORACLE_PICKS_ENV} and {PICK_BASELINE_ENV} are two pick rules; set one')
+        if oracle_picks is not None and oracle_record is not None:
+            problems.append(f'{ORACLE_PICKS_ENV} and {ORACLE_RECORD_ENV}: a serve records or replays, not both')
         if problems:
             raise ValueError('expert predictor: ' + '; '.join(problems))
         self.cfg, self._state, self.demand_stripes = cfg, state, demand_stripes
@@ -221,6 +239,10 @@ class PrefetchHooks(DecodeHooks):
         self.shared_cfg, self.shared_fast = shared, shared_fast
         self.shared: SharedEvict | None = None
         self.pick, self.layer_counters = pick, layer_counters
+        self.no_copies, self.oracle_record, self.oracle_picks = no_copies, oracle_record, oracle_picks
+        self.oracle_request = -1   # ordinal of the requests that reached a decode step, the file index in both modes
+        self.oracle_log: list[torch.Tensor] = []
+        self.oracle_rows: torch.Tensor | None = None
 
     # -- setup ---------------------------------------------------------------------
 
@@ -257,6 +279,16 @@ class PrefetchHooks(DecodeHooks):
         if self.pick is not None:
             self.pick_ids = torch.arange(self.first * E, (self.first + H) * E, device=dev).view(H, E)
             self.pick_requests = torch.zeros(1, dtype=torch.int64, device=dev)   # begin_request counts
+        if self.oracle_record is not None:
+            self.oracle_record.mkdir(parents=False, exist_ok=False)
+        if self.oracle_picks is not None:
+            files = sorted(self.oracle_picks.glob('routes_*.pt'))
+            if not files or [f.name for f in files] != [f'routes_{i:04d}.pt' for i in range(len(files))]:
+                raise ValueError(f'{ORACLE_PICKS_ENV}: {self.oracle_picks} does not hold routes_0000.pt onward without gaps')
+            self.oracle_table = [torch.load(f, map_location='cpu', weights_only=True) for f in files]
+            self.oracle_mask = torch.full((H, E), ORACLE_OTHER, dtype=torch.float32, device=dev)
+            self.oracle_mismatch = torch.zeros(1, dtype=torch.int64, device=dev)   # steps whose live routes differ from the record
+            self.oracle_missing = torch.zeros(1, dtype=torch.int64, device=dev)   # steps with no recorded row
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode step of the running graph
         slots, stripes = kernels.GROUPS * kernels.SLOTS, kernels.PUMP_STRIPES
         self.demand = StripedDemand(L, E, self.demand_stripes, stage_slots=slots, device=dev)
@@ -318,6 +350,12 @@ class PrefetchHooks(DecodeHooks):
             logger.info('expert predictor: baseline picks %s, seed %d', *self.pick)
         if self.layer_counters:
             logger.info('expert predictor: layer counters on')
+        if self.no_copies:
+            logger.info('expert predictor: no prefetch copies')
+        if self.oracle_record is not None:
+            logger.info('expert predictor: oracle record to %s', self.oracle_record)
+        if self.oracle_picks is not None:
+            logger.info('expert predictor: oracle picks from %d requests', len(self.oracle_table))
 
     def bind(self, engine, cache: OffloadMoeCache) -> None:
         base = self.cfg.base_model
@@ -369,6 +407,8 @@ class PrefetchHooks(DecodeHooks):
                 torch.save(dict(stamps=torch.stack(self.stamp_rows).cpu(), step=torch.tensor(self.stamp_steps),
                                 join=torch.stack(self.join_rows).cpu(), start_layer=self.learned.start_layer),
                            self.timing)
+            if self.oracle_record is not None and self.oracle_log:
+                self._write_routes()
         self.uid, self.steps = uid, 0
         # The previous token's graph joined its probe and demand streams into main, so these
         # writes on main are ordered after all of its prefetch work.
@@ -380,6 +420,10 @@ class PrefetchHooks(DecodeHooks):
             self.layer_published.zero_()
         if self.pick is not None:
             self.pick_requests.add_(1)   # the same request order gives the same hash in each serve of an arm
+        if self.oracle_picks is not None:
+            self.oracle_mask.fill_(ORACLE_OTHER)
+            self.oracle_mismatch.zero_()
+            self.oracle_missing.zero_()
         self.records.fill_(-1)
         self.cursors.zero_()
         self.payload.zero_()
@@ -410,8 +454,38 @@ class PrefetchHooks(DecodeHooks):
         # GEN > 0 on every token; a stage published under another token's GEN is never read.
         self.demand.gen.fill_(step + 1)
         self.live['prev'].copy_(self.live['routes'])  # token t-1's routes for prevwin
+        if step == 0:
+            self.oracle_request += 1
+            self.oracle_log = []
+        if self.oracle_picks is not None:
+            self._oracle_scores(step)
+
+    def _oracle_scores(self, step: int) -> None:
+        """Mark the routes of this decode step as the picks (main stream, before the graph replays; the probe stream's
+        score section joins main at layer 0). No recorded row leaves every expert ineligible, and it is counted."""
+        if step == 0:
+            k = self.oracle_request
+            rows = self.oracle_table[k] if k < len(self.oracle_table) else None
+            self.oracle_rows = None if rows is None else rows.to(self.probs.device, dtype=torch.int64)
+        self.oracle_mask.fill_(ORACLE_OTHER)
+        if self.oracle_rows is None or step >= self.oracle_rows.shape[0]:
+            self.oracle_missing.add_(1)
+            return
+        self.oracle_mask.scatter_(1, self.oracle_rows[step, self.first:], ORACLE_NEEDED)
+
+    def _write_routes(self) -> None:
+        """The routes of the finished request: (steps, layers, top-k) int16, written once under its ordinal."""
+        path = self.oracle_record / f'routes_{self.oracle_request:04d}.pt'
+        tmp = path.with_suffix('.tmp')
+        torch.save(torch.stack(self.oracle_log).to(torch.int16).cpu(), tmp)
+        tmp.rename(path)
+        self.oracle_log = []
 
     def after_decode(self, step: int, consumed: torch.Tensor, sampled: torch.Tensor) -> None:
+        if self.oracle_record is not None:
+            self.oracle_log.append(self.live['routes'].clone())
+        if self.oracle_picks is not None and self.oracle_rows is not None and step < self.oracle_rows.shape[0]:
+            self.oracle_mismatch.add_((self.live['routes'] != self.oracle_rows[step]).any().to(torch.int64))
         for name, t in self.live.items():
             self.score_inputs[name].copy_(t)
         rows = self.cfg.features.token_table_rows
@@ -478,6 +552,9 @@ class PrefetchHooks(DecodeHooks):
         prior must not move; the mask keeps it on the device.
         """
         raw, feats = self.raw, self.cfg.features
+        if self.no_copies:   # the constructor requires the fused path, whose scores read only frozen inputs and token buffers
+            self._score_shared()
+            return
         if self.shared_fast is None:
             self._copy_raw()
         if self.learned is None:
@@ -511,6 +588,8 @@ class PrefetchHooks(DecodeHooks):
         if self.pick is not None:
             kind, seed = self.pick
             self.probs.copy_(baseline_scores(kind, prior, self.pick_ids, self.step, self.pick_requests, seed))
+        if self.oracle_picks is not None:
+            self.probs.copy_(self.oracle_mask)
 
     def _copy_raw(self) -> None:
         """The prefetch bank's raw features of the target heads from the end-of-token-t inputs."""
@@ -601,7 +680,7 @@ class PrefetchHooks(DecodeHooks):
         main = torch.cuda.current_stream()
         probe, demand = self.probe_stream, self.demand
         sl = kernels.SECTION_LAYERS
-        if layer_id < self.sections * sl:
+        if layer_id < self.sections * sl and not self.no_copies:
             section = layer_id // sl
             wait_inputs()
             with torch.cuda.stream(probe):
@@ -648,6 +727,8 @@ class PrefetchHooks(DecodeHooks):
         if self.learned is not None:
             out.update(zip(('evict_' + c for c in EVICT_COUNTERS), self.learned.counters.tolist()))
             out['evict_nonfinite_tokens'] = int(self.nonfinite_tokens)
+        if self.oracle_picks is not None:
+            out.update(oracle_mismatch_steps=int(self.oracle_mismatch), oracle_missing_steps=int(self.oracle_missing))
         return out
 
 
@@ -666,7 +747,14 @@ def create_decode_hooks(source: str, config: EngineConfig) -> PrefetchHooks:
     return PrefetchHooks(cfg, state, config.moe_demand_copy_stripes, evict_from_env(os.environ),
                          Path(timing) if timing else None, os.environ.get(EVICT_TIMING_ALL_ENV) == '1', release,
                          shared_evict_from_env(os.environ), shared_fast_from_env(os.environ),
-                         pick_baseline_from_env(os.environ), os.environ.get(LAYER_COUNTERS_ENV) == '1')
+                         pick_baseline_from_env(os.environ), os.environ.get(LAYER_COUNTERS_ENV) == '1',
+                         os.environ.get(NO_COPIES_ENV) == '1', _folder_from_env(ORACLE_RECORD_ENV),
+                         _folder_from_env(ORACLE_PICKS_ENV))
+
+
+def _folder_from_env(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(value) if value else None
 
 
 def evict_from_env(env) -> tuple[Path, int] | None:

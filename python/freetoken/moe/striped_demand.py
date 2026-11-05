@@ -18,6 +18,9 @@ import triton
 import triton.language as tl
 
 from freetoken.moe.decode_hooks import DecodeHooks
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -129,9 +132,14 @@ class StripedDemandHooks(DecodeHooks):
 
     single_request = False  # no per-request state: every miss reads the host
 
-    def __init__(self, num_layers: int, num_experts: int, stripes: int):
+    def __init__(self, num_layers: int, num_experts: int, stripes: int, log_misses: bool = False):
         self.shape = (num_layers, num_experts, stripes)
         self.demand: StripedDemand | None = None
+        # FREETOKEN_DEMAND_MISS_LOG (EXP603, untimed serves). The kernel always counts; the flag only logs the
+        # counters when the next request starts, which reads the device.
+        self.log_misses = log_misses
+        self.uid: int | None = None
+        self.steps = 0
 
     def reserve(self, engine) -> None:
         num_layers, num_experts, stripes = self.shape
@@ -140,9 +148,20 @@ class StripedDemandHooks(DecodeHooks):
 
     def bind(self, engine, cache) -> None:
         self.demand.check_cache(cache)
+        if self.log_misses:
+            logger.info("striped demand: miss log on")
 
     def begin_request(self, uid: int) -> None:
+        # The same rule as PrefetchHooks: a long prompt starts one prefill per chunk with one uid, so only a new uid
+        # with decode steps ends a request. The counters then hold the last prefill chunk and the decode steps.
+        if self.log_misses and uid != self.uid and self.steps:
+            logger.info("striped demand: request %s, %d decode steps, misses per layer: %s",
+                        self.uid, self.steps, self.demand.counters[:, 1].tolist())
+        self.uid, self.steps = uid, 0
         self.demand.reset()
+
+    def after_decode(self, step: int, consumed: torch.Tensor, sampled: torch.Tensor) -> None:
+        self.steps = step + 1
 
     def copy_missing(self, cache, layer_id: int) -> bool:
         self.demand.copy(cache, layer_id)
