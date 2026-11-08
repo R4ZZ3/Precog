@@ -1,0 +1,4 @@
+# Local outputs of replication/setup.sh and run_bench.py. The friend sends results/ back as a zip.
+local_paths.json
+results/
+__pycache__/

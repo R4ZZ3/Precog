@@ -1,0 +1,152 @@
+{
+ "about": "RTX 4080 reference numbers for the replication report. Every value is copied from the source files named in sources, by a one-off script; nothing here was typed by hand. x = R584, y = F0Q. ms values are RAW-clock ms per generated token after the first one (decode only, prefill excluded). Intervals are 99 % prompt-bootstrap intervals, 2000 draws, conditional on the observed serves.",
+ "hardware": {
+  "gpu": "NVIDIA GeForce RTX 4080",
+  "vram_mib": 16376,
+  "pcie_max": "gen 4 x16 (nvidia-smi max link, read 2026-11-08)",
+  "host": "Windows 11 + WSL2, Intel i5-11600K (6 cores, 12 threads), WSL memory 47 GiB",
+  "os_note": "The engine ran inside WSL2. A native Linux host can differ in host-to-GPU copy speed."
+ },
+ "engine_commit": "16d7cd485d68599972e3b9c2ae6798c32d72cb49",
+ "groups": {
+  "code": {
+   "experiment": "EXP605 attempt 2",
+   "decode": 1024,
+   "serves_per_arm": 2,
+   "seed": 605,
+   "note": "EXP605 ran four arms (F0Q, PO, E, R584) with 2 timed serves each. The replication runs F0Q and R584 with 3 each.",
+   "ms": {
+    "pooled_ms": -1.3650078789472073,
+    "pooled_ci_99": [
+     -1.5433662342232262,
+     -1.2012495035073685
+    ],
+    "verdict": "faster",
+    "label": "faster",
+    "half_width_ms": 0.11905536630046765,
+    "serve_means_ms": {
+     "F0Q": [
+      14.530044703472432,
+      14.46990222274946
+     ],
+     "R584": [
+      13.151454662318141,
+      13.118476506009335
+     ]
+    },
+    "prompts": 40
+   },
+   "rate": {
+    "x_tok_s": 76.13,
+    "y_tok_s": 68.97,
+    "diff_tok_s": 7.17,
+    "diff_ci_99": [
+     6.54,
+     7.78
+    ],
+    "gain_pct": 10.4,
+    "gain_pct_ci_99": [
+     9.3,
+     11.5
+    ],
+    "prompts": 40,
+    "prompts_x_faster": 40
+   }
+  },
+  "math": {
+   "experiment": "EXP609 attempt 1",
+   "decode": 256,
+   "serves_per_arm": 3,
+   "seed": 607,
+   "ms": {
+    "pooled_ms": -1.5846159881581188,
+    "pooled_ci_99": [
+     -1.7153152464885089,
+     -1.4588854886767963
+    ],
+    "verdict": "faster",
+    "label": "faster",
+    "half_width_ms": 0.1698094067188282,
+    "serve_means_ms": {
+     "F0Q": [
+      15.661477389307146,
+      15.628000161851364,
+      15.58785537939733
+     ],
+     "R584": [
+      14.099198809137803,
+      14.02614000862277,
+      13.99814614832091
+     ]
+    },
+    "prompts": 40
+   },
+   "rate": {
+    "x_tok_s": 71.22,
+    "y_tok_s": 64.0,
+    "diff_tok_s": 7.22,
+    "diff_ci_99": [
+     6.74,
+     7.72
+    ],
+    "gain_pct": 11.3,
+    "gain_pct_ci_99": [
+     10.5,
+     12.1
+    ],
+    "prompts": 40,
+    "prompts_x_faster": 40
+   }
+  },
+  "qa": {
+   "experiment": "EXP609 attempt 1",
+   "decode": 256,
+   "serves_per_arm": 3,
+   "seed": 607,
+   "ms": {
+    "pooled_ms": -0.58677725159309,
+    "pooled_ci_99": [
+     -0.7102233155723264,
+     -0.4686828375833754
+    ],
+    "verdict": "faster",
+    "label": "faster",
+    "half_width_ms": 0.16761897315945434,
+    "serve_means_ms": {
+     "F0Q": [
+      13.586543118529818,
+      13.553400048421121,
+      13.519427154410641
+     ],
+     "R584": [
+      13.026739831582423,
+      12.946852618330798,
+      12.925446116669084
+     ]
+    },
+    "prompts": 40
+   },
+   "rate": {
+    "x_tok_s": 77.12,
+    "y_tok_s": 73.78,
+    "diff_tok_s": 3.34,
+    "diff_ci_99": [
+     2.72,
+     3.96
+    ],
+    "gain_pct": 4.5,
+    "gain_pct_ci_99": [
+     3.6,
+     5.4
+    ],
+    "prompts": 40,
+    "prompts_x_faster": 39
+   }
+  }
+ },
+ "sources": {
+  "exp605_estimate_a2.json": "760b8a4c209b9df10cdebc3ff8b6908417e9e82a0b7d9952fa6c79383a718db1",
+  "exp609_estimate_a1.json": "b254367ac57d3cc5b5c9005125fac8764106b1ecb982e2b4c4761bc87e2bf307",
+  "rates.json": "80839445232f27126b58b40318a0b03357ddc2d45e17b137ca12216b9c638b47"
+ }
+}
