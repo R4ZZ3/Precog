@@ -12,29 +12,77 @@
 
 > [!NOTE]
 > **This is a fork of [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0) at commit 2d8b9cc.**
-> It adds faster expert offloading and an optional learned expert predictor for
+> It adds faster expert offloading, an optional learned expert predictor and learned cache eviction for
 > `Qwen/Qwen3.5-35B-A3B-FP8`. The new offload and predictor features are opt-in flags. The fork also fixes
 > the automatic cache budget (`--moe-cache-auto` with `--num-pages`).
 > The FreeToken team did not make or review this fork.
 
-## This fork: CommitMoE expert prefetch
+## This fork: CommitMoE expert prefetch and learned eviction
 
 <div align="center">
-  <a href="docs/media/commitmoe-story.mp4">
-    <img alt="Video: how this fork came about and what it measured (110 s)" src="docs/media/commitmoe-story-poster.jpg" width=80%>
+  <a href="https://www.youtube.com/watch?v=7EmCkXHASLk">
+    <img alt="Video: prediction-based prefetch and eviction with Qwen3.5-35B-A3B" src="docs/media/commitmoe-video-poster.jpg" width=80%>
   </a>
-  <br><sub>Video (110 s): how this work came about and what we measured. Select the image to play it.</sub>
+  <br><sub>Video on YouTube: how this work came about and what we measured. Select the image to play it.</sub>
 </div>
 
-On one RTX 4080 16 GB under WSL2 with `Qwen/Qwen3.5-35B-A3B-FP8`, one 256-token request at a time and at
-the same configured memory budget, this fork decoded faster than upstream FreeToken 2d8b9cc on all 50
-prompts of five domains (coding, math, chat, Finnish, summarization). The median speed-up per domain
-was 1.80x to 1.95x; per prompt it was 1.69x to 2.06x. The median over the 50 prompts was 32.4 tokens/s
-upstream, 61.1 tokens/s with the fork, and 61.3 tokens/s with the fork and the predictor. With the
-predictor, we observed about 1% lower decode time on coding and math, and no clear difference on the
-other domains. These small predictor effects need repeated runs on independent servers.
+`Qwen/Qwen3.5-35B-A3B-FP8` has about 34 GiB of weights. On a 16 GB GPU, most experts stay in host RAM,
+and a token that routes to a missing expert waits for a copy over PCIe. This fork adds two learned
+parts to FreeToken's offload path:
 
-The flags, the install, the run command, the limits and the full benchmark are in
+- **Prefetch.** At the end of each token, a predictor names experts that the next token will
+  probably use. The engine copies them early, while the GPU computes.
+- **Learned eviction.** A second head scores how soon each cached expert will be used again. The
+  cache evicts the expert with the lowest score inside a layer, not the least recently used one.
+
+Neither part changes which experts the router selects. In every run below, both arms streamed the same text.
+
+### Results
+
+Both arms use the same GPU memory. **F0Q** is this fork with striped demand copies and no predictor
+(3571 expert slots). **R584** adds the predictor, copy overlap and learned eviction (3496 expert
+slots; the 75 slots pay for the predictor). One request at a time, greedy decoding, 40 held-out
+prompts per set. Speed is decode tokens/s (prefill excluded). Intervals are 99% bootstrap intervals over prompts.
+
+| Set | GPU | F0Q | R584 | Gain, % [99%] | R584 faster on |
+|---|---|---|---|---|---|
+| Coding, 1024 tokens | RTX 4080 16 GB | 68.97 | 76.13 | +10.4 [9.3, 11.5] | 40 of 40 |
+| Coding, 1024 tokens | RTX 5090 32 GB | 130.78 | 136.70 | +4.5 [3.5, 5.6] | 36 of 40 |
+| Math (MATH-500), 256 tokens | RTX 4080 16 GB | 64.00 | 71.22 | +11.3 [10.5, 12.1] | 40 of 40 |
+| Math (MATH-500), 256 tokens | RTX 5090 32 GB | 120.46 | 127.20 | +5.6 [4.9, 6.4] | 40 of 40 |
+| Open questions (NQ-open), 256 tokens | RTX 4080 16 GB | 73.78 | 77.12 | +4.5 [3.6, 5.4] | 39 of 40 |
+| Open questions (NQ-open), 256 tokens | RTX 5090 32 GB | 137.93 | 137.80 | -0.1 [-1.0, 0.7] | 23 of 40 |
+
+- The RTX 5090 run is an independent repeat by Elja-Ilari Placido De Oliveira on a different host
+  (Ryzen 9 9950X3D, PCIe gen 5, WSL2). It used the slot counts of the 16 GB GPU on purpose, so it
+  tests the same cache pressure on faster hardware. Every gate of the run passed.
+- On the RTX 5090, R584 is faster on coding and math. On open questions the difference is not resolved.
+- The RTX 5090 run changed the GPU, the PCIe link and the host together. It cannot say which part
+  made the gain smaller.
+- Limits: one model, batch size 1, greedy decoding, one machine per GPU. The intervals cover prompts,
+  not machines or days. The predictor's training prompts were 99% coding prompts.
+
+Against upstream FreeToken 2d8b9cc, the fork without the predictor decoded 1.80x to 1.95x faster
+(median per domain, 50 prompts of five domains, RTX 4080, sampling on). That earlier benchmark is in
+[docs/expert-predictor.md](docs/expert-predictor.md).
+
+### Repeat the test on your GPU
+
+The engine code of R584 and the test kit are on the branch
+[`replication-rtx5090`](https://github.com/R4ZZ3/FreeToken-CommitMoE/tree/replication-rtx5090), in the folder [`replication/`](https://github.com/R4ZZ3/FreeToken-CommitMoE/tree/replication-rtx5090/replication).
+The kit needs Linux x86_64 (WSL2 works), an NVIDIA driver r580 or later, 48 GB of host RAM and 45 GB of free disk.
+
+```bash
+git clone -b replication-rtx5090 https://github.com/R4ZZ3/FreeToken-CommitMoE.git
+cd FreeToken-CommitMoE
+bash replication/setup.sh                      # builds the engine, downloads the pinned model and predictor, checks every hash
+.venv/bin/python replication/run_bench.py      # two passes of seven serves each, then writes report.html
+```
+
+The run took about 83 minutes on the RTX 5090. It stops at the first failed gate and never stops a
+process that it did not start. The report is in `replication/results/<run name>/report.html`.
+
+For normal serving, the flags, the install and the limits are in
 [docs/expert-predictor.md](docs/expert-predictor.md). The predictor weights are on Hugging Face:
 [RASMUS/qwen3.5-35b-a3b-fp8-expert-predictor](https://huggingface.co/RASMUS/qwen3.5-35b-a3b-fp8-expert-predictor).
 
