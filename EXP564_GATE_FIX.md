@@ -83,7 +83,7 @@ From commitmoe_export:
 
 ```bash
 rtk proxy env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 \
-/home/rasmus/miniconda3/envs/commitmoe-cu13/bin/python -m pytest -q \
+python -m pytest -q \
 --noconftest -p no:cacheprovider \
 ft_fork_564_gate/commitmoe_prefetch/tests/test_summary_contract.py
 ```
