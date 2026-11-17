@@ -11,13 +11,15 @@
 </p>
 
 > [!NOTE]
-> **This is a fork of [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0) at commit 2d8b9cc.**
+> **Precog is a fork of [FreeToken](https://github.com/FlashML-org/FreeToken) by FlashML-org (Apache-2.0), at commit 2d8b9cc.**
+> The engine, the kernels and the offload design are FreeToken's work
+> ([paper](https://arxiv.org/abs/2608.16157), [license](LICENSE)). If you use this repository, cite FreeToken.
 > It adds faster expert offloading, an optional learned expert predictor and learned cache eviction for
 > `Qwen/Qwen3.5-35B-A3B-FP8`. The new offload and predictor features are opt-in flags. The fork also fixes
 > the automatic cache budget (`--moe-cache-auto` with `--num-pages`).
 > The FreeToken team did not make or review this fork.
 
-## This fork: CommitMoE expert prefetch and learned eviction
+## Precog: learned expert prefetch and eviction on FreeToken
 
 <div align="center">
   <a href="https://www.youtube.com/watch?v=7EmCkXHASLk">
@@ -69,18 +71,21 @@ Against upstream FreeToken 2d8b9cc, the fork without the predictor decoded 1.80x
 ### Repeat the test on your GPU
 
 The engine code of R584 and the test kit are on the branch
-[`replication-rtx5090`](https://github.com/R4ZZ3/FreeToken-CommitMoE/tree/replication-rtx5090), in the folder [`replication/`](https://github.com/R4ZZ3/FreeToken-CommitMoE/tree/replication-rtx5090/replication).
+[`replication-rtx5090`](https://github.com/R4ZZ3/Precog/tree/replication-rtx5090), in the folder [`replication/`](https://github.com/R4ZZ3/Precog/tree/replication-rtx5090/replication).
 The kit needs Linux x86_64 (WSL2 works), an NVIDIA driver r580 or later, 48 GB of host RAM and 45 GB of free disk.
 
 ```bash
-git clone -b replication-rtx5090 https://github.com/R4ZZ3/FreeToken-CommitMoE.git
-cd FreeToken-CommitMoE
+git clone -b replication-rtx5090 https://github.com/R4ZZ3/Precog.git
+cd Precog
 bash replication/setup.sh                      # builds the engine, downloads the pinned model and predictor, checks every hash
 .venv/bin/python replication/run_bench.py      # two passes of seven serves each, then writes report.html
 ```
 
 The run took about 83 minutes on the RTX 5090. It stops at the first failed gate and never stops a
 process that it did not start. The report is in `replication/results/<run name>/report.html`.
+
+The Python package of the predictor has the older internal name `commitmoe_prefetch`. The tested engine
+commit is pinned by hash, so the package keeps that name.
 
 For normal serving, the flags, the install and the limits are in
 [docs/expert-predictor.md](docs/expert-predictor.md). The predictor weights are on Hugging Face:
